@@ -10,6 +10,7 @@ import os, re, time, warnings
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
+from transformers import pipeline
 
 warnings.filterwarnings("ignore")
 
@@ -211,7 +212,34 @@ def main():
         print("\n[ERROR] No articles survived cleaning.")
         return
 
-    df_clean[["Date", "Stock", "News_Text", "Source"]].to_csv(OUTPUT_FILE, index=False)
+    print("\n[INFO] Running FinBERT on headlines. This might take a while...")
+    try:
+        sentiment_pipeline = pipeline("sentiment-analysis", model="ProsusAI/finbert", top_k=None)
+        texts = df_clean["News_Text"].tolist()
+        
+        # Process in batches
+        results = sentiment_pipeline(texts, batch_size=32, truncation=True)
+        
+        positive_scores = []
+        negative_scores = []
+        neutral_scores = []
+        
+        for res_list in results:
+            scores = {item['label']: item['score'] for item in res_list}
+            positive_scores.append(scores.get('positive', 0.0))
+            negative_scores.append(scores.get('negative', 0.0))
+            neutral_scores.append(scores.get('neutral', 0.0))
+            
+        df_clean["news_positive"] = positive_scores
+        df_clean["news_negative"] = negative_scores
+        df_clean["news_neutral"] = neutral_scores
+        
+        cols_to_save = ["Date", "Stock", "News_Text", "Source", "news_positive", "news_negative", "news_neutral"]
+    except Exception as e:
+        print(f"\n[WARNING] FinBERT failed ({e}). Saving without sentiment columns.")
+        cols_to_save = ["Date", "Stock", "News_Text", "Source"]
+
+    df_clean[cols_to_save].to_csv(OUTPUT_FILE, index=False)
 
     print("\n" + "=" * 60)
     print(f"  ✅ Saved → {OUTPUT_FILE}")

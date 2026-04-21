@@ -60,7 +60,7 @@ def train():
     X_test, y_test  = _get_X(test_df),  test_df["label"].values
     _p("i", f"Training on {X_train.shape[1]} features, {len(X_train)} rows ...")
 
-    model = XGBClassifier(**XGBOOST_PARAMS)
+    model = XGBClassifier(**XGBOOST_PARAMS, early_stopping_rounds=30)
     model.fit(X_train, y_train, eval_set=[(X_val,y_val)], verbose=100)
 
     y_pred_train  = model.predict(X_train)

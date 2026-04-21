@@ -71,7 +71,7 @@ XGBOOST_FEATURES = [
     "RSI_lag1", "MACD_lag1", "OBV_lag1", "Return_1d_lag1",
     "Close_roll_mean_5", "Close_roll_std_5",
     "Close_roll_mean_10", "Close_roll_std_10",
-    "Close_roll_mean_20",
+    "Close_roll_mean_20", "Close_roll_std_20",
     "PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
     "Revenue_Growth", "Profit_Growth",
     "event_score_max", "event_count", "is_event",

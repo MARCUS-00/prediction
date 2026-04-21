@@ -31,8 +31,11 @@ def get_feature_importance(payload=None, top_n=10):
     fn = payload["feature_names"]
     scores = {}
     for k,v in fi.items():
-        try:
-            idx = int(k[1:])
-            if idx < len(fn): scores[fn[idx]] = v
-        except (ValueError, IndexError): pass
+        if k in fn:
+            scores[k] = v
+        else:
+            try:
+                idx = int(k[1:])
+                if idx < len(fn): scores[fn[idx]] = v
+            except (ValueError, IndexError): pass
     return dict(sorted(scores.items(), key=lambda x:x[1], reverse=True)[:top_n])

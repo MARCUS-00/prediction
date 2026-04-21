@@ -6,7 +6,7 @@
 # Install: pip install yfinance pandas numpy ta
 # ============================================================
 
-import os, sys
+import os, sys, time
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -137,6 +137,7 @@ def main():
         except Exception as e:
             skipped += 1
             print(f"[ERROR] {e}")
+        time.sleep(1)
 
     if not all_data:
         print("\n[ERROR] No data downloaded. Check internet connection or yfinance.")

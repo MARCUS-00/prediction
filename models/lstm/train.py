@@ -20,20 +20,17 @@ from evaluation.metrics import evaluate_all
 def _p(tag, msg): print(f"  [{tag}] {msg}")
 
 
-def _build_sequences(df, scaler=None, fit_scaler=False):
+def _build_sequences(df, scaler):
     feats = [c for c in LSTM_FEATURES if c in df.columns]
-    if not feats: return np.array([]), np.array([]), scaler
+    if not feats: return np.array([]), np.array([])
     df     = df.sort_values("Date").copy()
     vals   = np.nan_to_num(df[feats].values.astype(np.float32), nan=0.0)
-    if fit_scaler:
-        scaler = MinMaxScaler(); vals = scaler.fit_transform(vals)
-    elif scaler:
-        vals = scaler.transform(vals)
+    vals = scaler.transform(vals)
     labels = df["label"].values.astype(int) if "label" in df.columns else np.zeros(len(df),int)
     X, y = [], []
     for i in range(SEQUENCE_LENGTH, len(vals)):
         X.append(vals[i-SEQUENCE_LENGTH:i]); y.append(labels[i])
-    return np.array(X), np.array(y), scaler
+    return np.array(X), np.array(y)
 
 
 def _loader(X, y, bs, shuffle=False):
@@ -68,15 +65,32 @@ def train():
     if missing_feats:
         _p("!", f"LSTM features missing from dataset: {missing_feats}")
 
+    # Build global scaler on all train portions
+    train_dfs = []
+    for stock in df["Stock"].unique():
+        sdf = df[df["Stock"]==stock].sort_values("Date").reset_index(drop=True)
+        n = len(sdf)
+        if n == 0: continue
+        t = int(n*TRAIN_RATIO)
+        train_dfs.append(sdf.iloc[:t])
+    
+    global_train = pd.concat(train_dfs) if train_dfs else pd.DataFrame()
+    scaler = MinMaxScaler()
+    existing_feats = [c for c in LSTM_FEATURES if c in global_train.columns]
+    if existing_feats and not global_train.empty:
+        global_train_vals = np.nan_to_num(global_train[existing_feats].values.astype(np.float32), nan=0.0)
+        scaler.fit(global_train_vals)
+
     Xtr,ytr,Xv,yv,Xte,yte = [],[],[],[],[],[]
-    scaler = None
+
     for stock in df["Stock"].unique():
         sdf = df[df["Stock"]==stock].sort_values("Date").reset_index(drop=True)
         n   = len(sdf)
+        if n == 0: continue
         t   = int(n*TRAIN_RATIO); v = int(n*(TRAIN_RATIO+VAL_RATIO))
-        X1,y1,scaler = _build_sequences(sdf.iloc[:t],   scaler=scaler, fit_scaler=(scaler is None))
-        X2,y2,_      = _build_sequences(sdf.iloc[t:v],  scaler=scaler)
-        X3,y3,_      = _build_sequences(sdf.iloc[v:],   scaler=scaler)
+        X1,y1 = _build_sequences(sdf.iloc[:t],   scaler)
+        X2,y2 = _build_sequences(sdf.iloc[t:v],  scaler)
+        X3,y3 = _build_sequences(sdf.iloc[v:],   scaler)
         if len(X1): Xtr.append(X1); ytr.append(y1)
         if len(X2): Xv.append(X2);  yv.append(y2)
         if len(X3): Xte.append(X3); yte.append(y3)

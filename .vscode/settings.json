@@ -1,5 +1,9 @@
 {
     "git.autofetch": true,
     "git.enableSmartCommit": true,
-    "git.confirmSync": false
+    "git.confirmSync": false,
+    "git-auto-commit.autoCommit": true,
+    "git-auto-commit.autoPush": true,
+    "git-auto-commit.interval": 300,
+    "git-auto-commit.commitMessage": "Auto-sync update"
 }
