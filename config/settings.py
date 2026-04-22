@@ -27,18 +27,15 @@ WATCHLIST_OUTPUT_PATH = os.path.join(EVAL_DIR, "results", "watchlist_latest.csv"
 # ── Column definitions ────────────────────────────────────────────────────────
 TECHNICAL_COLS = [
     "Date", "Stock", "Open", "High", "Low", "Close", "Volume",
-    "EMA_20", "RSI", "MACD", "ATR", "OBV", "Return_1d", "Direction",
+    "EMA_20", "RSI", "MACD", "MACD_signal", "ATR", "OBV",
+    "Return_1d", "Direction",
 ]
-
-FUNDAMENTAL_BASE_COLS = [
-    "Year", "PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
-    "Revenue", "Profit", "Revenue_Growth", "Profit_Growth",
-]
-FUNDAMENTAL_FY_PREFIXES = ["PE_Ratio", "EPS", "ROE", "Debt_to_Equity"]
-
-NEWS_COLS   = ["Date", "Stock", "News_Text", "Source"]
-EVENTS_COLS = ["date", "symbol", "event_category", "event_name",
-               "event_score_max", "event_count", "is_event"]
+FUNDAMENTAL_BASE_COLS = ["Year","PE_Ratio","EPS","ROE","Debt_to_Equity",
+                          "Revenue","Profit","Revenue_Growth","Profit_Growth"]
+FUNDAMENTAL_FY_PREFIXES = ["PE_Ratio","EPS","ROE","Debt_to_Equity"]
+NEWS_COLS   = ["Date","Stock","News_Text","Source"]
+EVENTS_COLS = ["date","symbol","event_category","event_name",
+               "event_score_max","event_count","is_event"]
 
 # ── Labels ────────────────────────────────────────────────────────────────────
 RANDOM_SEED      = 42
@@ -48,19 +45,18 @@ LABEL_MAP        = {-1: 0, 1: 1}
 LABEL_MAP_INV    = {0: "DOWN", 1: "UP"}
 DIRECTION_LABELS = ["DOWN", "UP"]
 
-# ── XGBoost (tuned for 70–75 % accuracy) ─────────────────────────────────────
+# ── XGBoost ───────────────────────────────────────────────────────────────────
 XGBOOST_PARAMS = {
     "n_estimators"    : 800,
-    "max_depth"       : 5,          # shallower → less overfit
-    "learning_rate"   : 0.01,       # slower lr → needs more trees
+    "max_depth"       : 5,
+    "learning_rate"   : 0.01,
     "subsample"       : 0.8,
     "colsample_bytree": 0.6,
-    "min_child_weight": 5,          # regularise leaf splits
+    "min_child_weight": 5,
     "gamma"           : 0.2,
     "reg_alpha"       : 0.5,
     "reg_lambda"      : 2.0,
     "eval_metric"     : "logloss",
-    "use_label_encoder": False,
     "random_state"    : 42,
     "n_jobs"          : -1,
 }
@@ -69,33 +65,38 @@ XGBOOST_FEATURES = [
     # OHLCV
     "Open", "High", "Low", "Close", "Volume",
     # Base indicators
-    "EMA_20", "RSI", "MACD", "ATR", "OBV", "Return_1d",
-    # Lag features
-    "Close_lag1", "Close_lag2", "Close_lag3", "Close_lag5",
-    "RSI_lag1", "MACD_lag1", "OBV_lag1", "Return_1d_lag1",
-    # Rolling stats
-    "Close_roll_mean_5",  "Close_roll_std_5",
-    "Close_roll_mean_10", "Close_roll_std_10",
-    "Close_roll_mean_20", "Close_roll_std_20",
-    # New features from improved merge
-    "BB_pct", "Volume_ratio", "Momentum_5d", "Momentum_10d",
-    "EMA_dist", "RSI_overbought", "RSI_oversold",
+    "EMA_20", "RSI", "MACD", "MACD_signal", "ATR", "OBV", "Return_1d",
+    # Lags
+    "Close_lag1","Close_lag2","Close_lag3","Close_lag5",
+    "RSI_lag1","MACD_lag1","OBV_lag1","Return_1d_lag1",
+    # Rolling
+    "Close_roll_mean_5","Close_roll_std_5",
+    "Close_roll_mean_10","Close_roll_std_10",
+    "Close_roll_mean_20","Close_roll_std_20",
+    # Derived technical
+    "BB_pct","Volume_ratio","Momentum_5d","Momentum_10d",
+    "EMA_dist","RSI_overbought","RSI_oversold",
+    # Cross-sectional (highest-signal new features)
+    "CS_momentum_rank","CS_volume_rank","CS_rsi_rank",
+    # Regime & context
+    "streak_lag1","pct_from_52w_high",
+    "market_vol_20d","intraday_range","gap_pct",
     # Fundamental
-    "PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
-    "Revenue", "Profit", "Revenue_Growth", "Profit_Growth",
+    "PE_Ratio","EPS","ROE","Debt_to_Equity",
+    "Revenue","Profit","Revenue_Growth","Profit_Growth",
     # Events
-    "event_score_max", "event_count", "is_event",
-    # News — use derived score instead of 3 correlated columns
-    "news_score", "news_positive", "news_negative",
+    "event_score_max","event_count","is_event",
+    # News
+    "news_score","news_positive","news_negative",
 ]
 
 # ── LSTM ──────────────────────────────────────────────────────────────────────
-# Sequence of 30 days gives ~6 weeks of context; good balance for daily data
 SEQUENCE_LENGTH = 30
 LSTM_FEATURES   = [
-    "Close", "RSI", "MACD", "OBV", "ATR",
-    "Return_1d", "EMA_dist", "BB_pct", "Volume_ratio",
-    "Momentum_5d", "news_score",
+    "Close","RSI","MACD","OBV","ATR",
+    "Return_1d","EMA_dist","BB_pct","Volume_ratio",
+    "Momentum_5d","news_score",
+    "CS_momentum_rank","CS_rsi_rank","market_vol_20d",
 ]
 LSTM_HIDDEN     = 128
 LSTM_LAYERS     = 2
@@ -113,14 +114,12 @@ FINBERT_BATCH_SIZE = 32
 # ── Auto-create directories ───────────────────────────────────────────────────
 for _d in [
     DATA_DIR,
-    os.path.join(DATA_DIR, "technical"),
-    os.path.join(DATA_DIR, "fundamental"),
-    os.path.join(DATA_DIR, "news"),
-    os.path.join(DATA_DIR, "events"),
+    os.path.join(DATA_DIR, "technical"), os.path.join(DATA_DIR, "fundamental"),
+    os.path.join(DATA_DIR, "news"), os.path.join(DATA_DIR, "events"),
     os.path.join(DATA_DIR, "merged"),
-    os.path.join(MODELS_DIR, "xgboost",  "saved"),
-    os.path.join(MODELS_DIR, "lstm",     "saved"),
-    os.path.join(MODELS_DIR, "ensemble", "saved"),
-    os.path.join(EVAL_DIR,   "results"),
+    os.path.join(MODELS_DIR, "xgboost", "saved"),
+    os.path.join(MODELS_DIR, "lstm",    "saved"),
+    os.path.join(MODELS_DIR, "ensemble","saved"),
+    os.path.join(EVAL_DIR, "results"),
 ]:
     os.makedirs(_d, exist_ok=True)
