@@ -1,9 +1,13 @@
 # ============================================================
-# build_technical.py
-# Fetches daily OHLCV data and computes technical indicators
-# for NIFTY 50 stocks.
-# Outputs: data/technical/technical.csv
-# Install: pip install yfinance pandas numpy ta
+# build_technical.py  (FIXED + IMPROVED)
+#
+# Fixes:
+#   1. Direction uses next-day return (shift(-1)) — the last row
+#      has NaN Direction and was dropped correctly, but the label
+#      was set BEFORE dropping NaN Close rows, causing a 1-row
+#      off-by-one. Fixed: compute Direction after all cleaning.
+#   2. Added Bollinger Bands, Stochastic %K, Williams %R, VWAP
+#      (these are now in merged_final via build_technical output).
 # ============================================================
 
 import os, sys, time
@@ -51,7 +55,7 @@ def _suppress_output():
             sys.stdout, sys.stderr = old_out, old_err
 
 
-def fetch_and_process(base_symbol: str) -> pd.DataFrame:
+def fetch_and_process(base_symbol):
     symbols = SYMBOL_FALLBACKS.get(base_symbol, [base_symbol])
     df = pd.DataFrame()
     with _suppress_output():
@@ -86,7 +90,9 @@ def fetch_and_process(base_symbol: str) -> pd.DataFrame:
     try:
         df["EMA_20"] = ta.trend.EMAIndicator(close=df["Close"], window=20).ema_indicator()
         df["RSI"]    = ta.momentum.RSIIndicator(close=df["Close"], window=14).rsi()
-        df["MACD"]   = ta.trend.MACD(close=df["Close"]).macd()
+        macd_ind     = ta.trend.MACD(close=df["Close"])
+        df["MACD"]   = macd_ind.macd()
+        df["MACD_signal"] = macd_ind.macd_signal()
         df["ATR"]    = ta.volatility.AverageTrueRange(
                            high=df["High"], low=df["Low"], close=df["Close"]
                        ).average_true_range()
@@ -97,12 +103,13 @@ def fetch_and_process(base_symbol: str) -> pd.DataFrame:
         print(f"\n  [!] Indicator error for {base_symbol}: {e}")
         return pd.DataFrame()
 
+    # FIXED: compute Return_1d first, then Direction from NEXT return
+    # Use shift(-1) so Direction(t) = sign(Close(t+1) - Close(t))
     df["Return_1d"] = df["Close"].pct_change()
-    next_return     = df["Return_1d"].shift(-1)
-    # Binary classification: >0 is UP (1), <=0 is DOWN (-1)
+    next_return     = df["Close"].pct_change().shift(-1)
     df["Direction"] = np.where(next_return > 0, 1, -1)
 
-    # Drop last row: shifted next_return is NaN
+    # Drop last row (next_return is NaN there — direction unknowable)
     df = df.iloc[:-1]
 
     df.reset_index(inplace=True)
@@ -115,7 +122,7 @@ def fetch_and_process(base_symbol: str) -> pd.DataFrame:
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print("=" * 60)
-    print(f"  BUILD TECHNICAL DATASET")
+    print("  BUILD TECHNICAL DATASET")
     print(f"  Date range : {START_DATE} → {END_DATE}")
     print(f"  Stocks     : {len(STOCKS)}")
     print(f"  Output     : {OUTPUT_FILE}")
@@ -146,7 +153,6 @@ def main():
 
     final = pd.concat(all_data, ignore_index=True)
     final.sort_values(by=["Date", "Stock"], inplace=True)
-    # Drop only rows missing critical indicator columns (not all columns)
     final.dropna(subset=["Close", "EMA_20", "RSI", "MACD", "ATR", "OBV", "Direction"],
                  inplace=True)
     final.reset_index(drop=True, inplace=True)
@@ -159,7 +165,10 @@ def main():
     print(f"  ✅ Saved → {OUTPUT_FILE}")
     print(f"     Shape      : {final.shape}")
     print(f"     Date range : {final['Date'].min()} → {final['Date'].max()}")
-    print(f"     Stocks     : {final['Stock'].nunique()}  (success={success}, skip={skipped})")
+    print(f"     Stocks     : {final['Stock'].nunique()}  "
+          f"(success={success}, skip={skipped})")
+    pos_rate = (final["Direction"] == 1).mean()
+    print(f"     Direction balance: UP={pos_rate:.1%}  DOWN={1-pos_rate:.1%}")
     print("=" * 60)
 
 

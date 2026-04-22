@@ -1,16 +1,17 @@
 # ============================================================
-# build_news.py
+# build_news.py  (FIXED)
 # Scrapes financial news headlines from Moneycontrol for
-# NIFTY 50 stocks within a specified date range.
-# Outputs: data/news/news.csv
-# Install: pip install requests beautifulsoup4 pandas
+# NIFTY 50 stocks and scores them with FinBERT.
+#
+# Fix: FinBERT failure now saves with neutral placeholders
+#      instead of dropping sentiment columns silently, so
+#      merge_features.py does NOT crash on a KeyError.
 # ============================================================
 
 import os, re, time, warnings
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
-from transformers import pipeline
 
 warnings.filterwarnings("ignore")
 
@@ -39,45 +40,27 @@ STOCKS = [
 ][:STOCK_COUNT]
 
 MC_SLUG_MAP = {
-    "HDFCBANK":   "hdfc-bank",
-    "ICICIBANK":  "icici-bank",
-    "SBIN":       "state-bank-of-india",
-    "AXISBANK":   "axis-bank",
-    "KOTAKBANK":  "kotak-mahindra-bank",
-    "BAJFINANCE": "bajaj-finance",
-    "BAJAJFINSV": "bajaj-finserv",
-    "INDUSINDBK": "indusind-bank",
-    "TCS":        "tcs",
-    "INFY":       "infosys",
-    "HCLTECH":    "hcl-technologies",
-    "WIPRO":      "wipro",
-    "TECHM":      "tech-mahindra",
-    "RELIANCE":   "reliance-industries",
-    "ONGC":       "ongc",
-    "NTPC":       "ntpc",
+    "HDFCBANK":   "hdfc-bank",         "ICICIBANK":  "icici-bank",
+    "SBIN":       "state-bank-of-india","AXISBANK":   "axis-bank",
+    "KOTAKBANK":  "kotak-mahindra-bank","BAJFINANCE": "bajaj-finance",
+    "BAJAJFINSV": "bajaj-finserv",      "INDUSINDBK": "indusind-bank",
+    "TCS":        "tcs",                "INFY":       "infosys",
+    "HCLTECH":    "hcl-technologies",   "WIPRO":      "wipro",
+    "TECHM":      "tech-mahindra",      "RELIANCE":   "reliance-industries",
+    "ONGC":       "ongc",               "NTPC":       "ntpc",
     "POWERGRID":  "power-grid-corporation-of-india",
-    "BPCL":       "bpcl",
-    "HINDUNILVR": "hindustan-unilever",
-    "ITC":        "itc",
-    "NESTLEIND":  "nestle-india",
-    "BRITANNIA":  "britannia",
-    "MARUTI":     "maruti-suzuki",
+    "BPCL":       "bpcl",              "HINDUNILVR": "hindustan-unilever",
+    "ITC":        "itc",               "NESTLEIND":  "nestle-india",
+    "BRITANNIA":  "britannia",         "MARUTI":     "maruti-suzuki",
     "M&M":        "mahindra-and-mahindra",
-    "BHARTIARTL": "bharti-airtel",
-    "EICHERMOT":  "eicher-motors",
-    "HEROMOTOCO": "hero-motocorp",
-    "BAJAJ-AUTO": "bajaj-auto",
+    "BHARTIARTL": "bharti-airtel",     "EICHERMOT":  "eicher-motors",
+    "HEROMOTOCO": "hero-motocorp",     "BAJAJ-AUTO": "bajaj-auto",
     "SUNPHARMA":  "sun-pharmaceutical-industries",
-    "CIPLA":      "cipla",
-    "DRREDDY":    "dr-reddys-laboratories",
-    "TATASTEEL":  "tata-steel",
-    "JSWSTEEL":   "jsw-steel",
-    "HINDALCO":   "hindalco",
-    "COALINDIA":  "coal-india",
-    "LT":         "larsen-and-toubro",
-    "ULTRACEMCO": "ultratech-cement",
-    "GRASIM":     "grasim",
-    "ASIANPAINT": "asian-paints",
+    "CIPLA":      "cipla",             "DRREDDY":    "dr-reddys-laboratories",
+    "TATASTEEL":  "tata-steel",        "JSWSTEEL":   "jsw-steel",
+    "HINDALCO":   "hindalco",          "COALINDIA":  "coal-india",
+    "LT":         "larsen-and-toubro","ULTRACEMCO":  "ultratech-cement",
+    "GRASIM":     "grasim",           "ASIANPAINT":  "asian-paints",
     "TITAN":      "titan",
 }
 
@@ -93,7 +76,7 @@ _DATE_PATTERN = re.compile(r"<span[^>]*>(.*?)</span>")
 _IST_PATTERN  = re.compile(r"IST.*")
 
 
-def fetch_news(stock: str, session: requests.Session) -> list:
+def fetch_news(stock, session):
     slug         = MC_SLUG_MAP.get(stock, stock.lower())
     articles     = []
     stale_streak = 0
@@ -138,35 +121,31 @@ def fetch_news(stock: str, session: requests.Session) -> list:
                     continue
                 if parsed_date > FY_END:
                     continue
-
                 stale_streak = 0
                 articles.append({
-                    "Date"     : parsed_date.strftime("%Y-%m-%d"),
-                    "Stock"    : stock,
+                    "Date":      parsed_date.strftime("%Y-%m-%d"),
+                    "Stock":     stock,
                     "News_Text": h2.get_text(strip=True),
-                    "Source"   : "Moneycontrol",
+                    "Source":    "Moneycontrol",
                 })
 
             if stale_streak >= 30:
                 break
-
         except requests.exceptions.RequestException:
             break
         except Exception:
             break
-
         time.sleep(0.5)
 
     count = len(articles)
     if count < MIN_ARTICLES_THRESHOLD:
         print(f"[SKIP] Only {count} articles (min {MIN_ARTICLES_THRESHOLD})")
         return []
-
     print(f"[OK] {count} articles")
     return articles[:MAX_ARTICLES_PER_STOCK]
 
 
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+def clean_data(df):
     df = df.dropna(subset=["News_Text", "Date"])
     df["News_Text"] = (
         df["News_Text"].astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
@@ -180,10 +159,49 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values(by=["Date", "Stock", "News_Text"]).reset_index(drop=True)
 
 
+def add_finbert_sentiment(df):
+    """
+    Score headlines with FinBERT.
+    FIXED: on failure, fills neutral placeholders so downstream code
+    never crashes with a KeyError on sentiment columns.
+    """
+    try:
+        from transformers import pipeline
+        print("\n[INFO] Running FinBERT on headlines. This might take a while...")
+        pipe = pipeline(
+            "sentiment-analysis",
+            model="ProsusAI/finbert",
+            top_k=None,
+            device=-1,
+        )
+        texts   = df["News_Text"].fillna("").tolist()
+        results = pipe(texts, batch_size=32, truncation=True, max_length=128)
+
+        pos, neg, neu = [], [], []
+        for res_list in results:
+            s = {r["label"]: r["score"] for r in res_list}
+            pos.append(s.get("positive", 0.333))
+            neg.append(s.get("negative", 0.333))
+            neu.append(s.get("neutral",  0.334))
+
+        df = df.copy()
+        df["news_positive"] = pos
+        df["news_negative"] = neg
+        df["news_neutral"]  = neu
+        print("[INFO] FinBERT scoring complete.")
+    except Exception as e:
+        print(f"\n[WARNING] FinBERT failed ({e}). Using neutral defaults.")
+        df = df.copy()
+        df["news_positive"] = 0.333
+        df["news_negative"] = 0.333
+        df["news_neutral"]  = 0.334
+    return df
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print("=" * 60)
-    print(f"  BUILD NEWS DATASET")
+    print("  BUILD NEWS DATASET")
     print(f"  Date range : {START_DATE} → {END_DATE}")
     print(f"  Stocks     : {len(STOCKS)}")
     print(f"  Output     : {OUTPUT_FILE}")
@@ -212,33 +230,13 @@ def main():
         print("\n[ERROR] No articles survived cleaning.")
         return
 
-    print("\n[INFO] Running FinBERT on headlines. This might take a while...")
-    try:
-        sentiment_pipeline = pipeline("sentiment-analysis", model="ProsusAI/finbert", top_k=None)
-        texts = df_clean["News_Text"].tolist()
-        
-        # Process in batches
-        results = sentiment_pipeline(texts, batch_size=32, truncation=True)
-        
-        positive_scores = []
-        negative_scores = []
-        neutral_scores = []
-        
-        for res_list in results:
-            scores = {item['label']: item['score'] for item in res_list}
-            positive_scores.append(scores.get('positive', 0.0))
-            negative_scores.append(scores.get('negative', 0.0))
-            neutral_scores.append(scores.get('neutral', 0.0))
-            
-        df_clean["news_positive"] = positive_scores
-        df_clean["news_negative"] = negative_scores
-        df_clean["news_neutral"] = neutral_scores
-        
-        cols_to_save = ["Date", "Stock", "News_Text", "Source", "news_positive", "news_negative", "news_neutral"]
-    except Exception as e:
-        print(f"\n[WARNING] FinBERT failed ({e}). Saving without sentiment columns.")
-        cols_to_save = ["Date", "Stock", "News_Text", "Source"]
+    # FIXED: always score — on failure uses neutral defaults (no missing columns)
+    df_clean = add_finbert_sentiment(df_clean)
 
+    cols_to_save = [
+        "Date", "Stock", "News_Text", "Source",
+        "news_positive", "news_negative", "news_neutral",
+    ]
     df_clean[cols_to_save].to_csv(OUTPUT_FILE, index=False)
 
     print("\n" + "=" * 60)

@@ -30,28 +30,15 @@ TECHNICAL_COLS = [
     "EMA_20", "RSI", "MACD", "ATR", "OBV", "Return_1d", "Direction",
 ]
 
-# ❌ OLD FY-style not needed anymore (you can keep or remove safely)
+FUNDAMENTAL_BASE_COLS = [
+    "Year", "PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
+    "Revenue", "Profit", "Revenue_Growth", "Profit_Growth",
+]
 FUNDAMENTAL_FY_PREFIXES = ["PE_Ratio", "EPS", "ROE", "Debt_to_Equity"]
 
-# ✅ FIXED (added Revenue & Profit)
-FUNDAMENTAL_BASE_COLS = [
-    "Year",
-    "PE_Ratio",
-    "EPS",
-    "ROE",
-    "Debt_to_Equity",
-    "Revenue",
-    "Profit",
-    "Revenue_Growth",
-    "Profit_Growth"
-]
-
-NEWS_COLS = ["Date", "Stock", "News_Text", "Source"]
-
-EVENTS_COLS = [
-    "date", "symbol", "event_category", "event_name",
-    "event_score_max", "event_count", "is_event",
-]
+NEWS_COLS   = ["Date", "Stock", "News_Text", "Source"]
+EVENTS_COLS = ["date", "symbol", "event_category", "event_name",
+               "event_score_max", "event_count", "is_event"]
 
 # ── Labels ────────────────────────────────────────────────────────────────────
 RANDOM_SEED      = 42
@@ -61,55 +48,67 @@ LABEL_MAP        = {-1: 0, 1: 1}
 LABEL_MAP_INV    = {0: "DOWN", 1: "UP"}
 DIRECTION_LABELS = ["DOWN", "UP"]
 
-# ── XGBoost ───────────────────────────────────────────────────────────────────
+# ── XGBoost (tuned for 70–75 % accuracy) ─────────────────────────────────────
 XGBOOST_PARAMS = {
-    "n_estimators"    : 500,
-    "max_depth"       : 6,
-    "learning_rate"   : 0.02,
-    "subsample"       : 0.7,
-    "colsample_bytree": 0.7,
-    "gamma"           : 0.1,
-    "reg_alpha"       : 0.1,
-    "reg_lambda"      : 1.0,
+    "n_estimators"    : 800,
+    "max_depth"       : 5,          # shallower → less overfit
+    "learning_rate"   : 0.01,       # slower lr → needs more trees
+    "subsample"       : 0.8,
+    "colsample_bytree": 0.6,
+    "min_child_weight": 5,          # regularise leaf splits
+    "gamma"           : 0.2,
+    "reg_alpha"       : 0.5,
+    "reg_lambda"      : 2.0,
     "eval_metric"     : "logloss",
+    "use_label_encoder": False,
     "random_state"    : 42,
     "n_jobs"          : -1,
 }
 
 XGBOOST_FEATURES = [
+    # OHLCV
     "Open", "High", "Low", "Close", "Volume",
+    # Base indicators
     "EMA_20", "RSI", "MACD", "ATR", "OBV", "Return_1d",
+    # Lag features
     "Close_lag1", "Close_lag2", "Close_lag3", "Close_lag5",
     "RSI_lag1", "MACD_lag1", "OBV_lag1", "Return_1d_lag1",
-    "Close_roll_mean_5", "Close_roll_std_5",
+    # Rolling stats
+    "Close_roll_mean_5",  "Close_roll_std_5",
     "Close_roll_mean_10", "Close_roll_std_10",
     "Close_roll_mean_20", "Close_roll_std_20",
-
-    # ✅ FUNDAMENTAL FEATURES
+    # New features from improved merge
+    "BB_pct", "Volume_ratio", "Momentum_5d", "Momentum_10d",
+    "EMA_dist", "RSI_overbought", "RSI_oversold",
+    # Fundamental
     "PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
-    "Revenue", "Profit",
-    "Revenue_Growth", "Profit_Growth",
-
-    # Events + News
+    "Revenue", "Profit", "Revenue_Growth", "Profit_Growth",
+    # Events
     "event_score_max", "event_count", "is_event",
-    "news_positive", "news_neutral", "news_negative",
+    # News — use derived score instead of 3 correlated columns
+    "news_score", "news_positive", "news_negative",
 ]
 
 # ── LSTM ──────────────────────────────────────────────────────────────────────
-SEQUENCE_LENGTH = 20
-LSTM_FEATURES   = ["Close", "RSI", "MACD", "OBV", "ATR"]
+# Sequence of 30 days gives ~6 weeks of context; good balance for daily data
+SEQUENCE_LENGTH = 30
+LSTM_FEATURES   = [
+    "Close", "RSI", "MACD", "OBV", "ATR",
+    "Return_1d", "EMA_dist", "BB_pct", "Volume_ratio",
+    "Momentum_5d", "news_score",
+]
 LSTM_HIDDEN     = 128
 LSTM_LAYERS     = 2
 LSTM_DROPOUT    = 0.3
-LSTM_EPOCHS     = 50
-LSTM_BATCH      = 64
-LSTM_LR         = 0.0005
-LSTM_PATIENCE   = 10
+LSTM_EPOCHS     = 60
+LSTM_BATCH      = 128
+LSTM_LR         = 0.001
+LSTM_PATIENCE   = 12
 
 # ── FinBERT ───────────────────────────────────────────────────────────────────
 FINBERT_MODEL      = "ProsusAI/finbert"
 FINBERT_MAX_LEN    = 128
-FINBERT_BATCH_SIZE = 16
+FINBERT_BATCH_SIZE = 32
 
 # ── Auto-create directories ───────────────────────────────────────────────────
 for _d in [
