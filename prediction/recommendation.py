@@ -5,7 +5,7 @@ def confidence_label(score: float) -> str:
 
 def recommendation(direction: str, confidence: float) -> str:
     if confidence < 0.70: return "OBSERVE"
-    return {"UP":"BUY","DOWN":"SELL","FLAT":"HOLD"}.get(direction,"OBSERVE")
+    return {"UP":"BUY","DOWN":"SELL"}.get(direction,"OBSERVE")
 
 def expected_movement(row, direction: str) -> str:
     atr   = float(row.get("ATR",  0.0) or 0.0)

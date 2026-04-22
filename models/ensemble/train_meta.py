@@ -17,11 +17,11 @@ def _p(tag, msg): print(f"  [{tag}] {msg}")
 
 
 def _news_proba(df):
-    cols = ["news_positive","news_neutral","news_negative"]
+    cols = ["news_positive","news_negative"] # Dropped neutral for binary? Or map it?
     if all(c in df.columns for c in cols):
-        arr = df[cols].fillna(1/3).values.astype(np.float32)
+        arr = df[cols].fillna(0.5).values.astype(np.float32)
         return arr / arr.sum(axis=1, keepdims=True).clip(min=1e-9)
-    return np.full((len(df),3), 1/3)
+    return np.full((len(df),2), 0.5)
 
 
 def train():
@@ -42,12 +42,23 @@ def train():
     df["label"] = df["Direction"].map(LABEL_MAP)
     df.dropna(subset=["label"], inplace=True)
     df["label"] = df["label"].astype(int)
-    df = df.sort_values("Date").reset_index(drop=True)
 
-    n = len(df)
-    t = int(n*TRAIN_RATIO); v = int(n*(TRAIN_RATIO+VAL_RATIO))
-    meta_df = pd.concat([df.iloc[t:v], df.iloc[v:]], ignore_index=True)
-    _p("✓", f"Meta stacking rows: {len(meta_df)}")
+    val_dfs, test_dfs = [], []
+    for stock in df["Stock"].unique():
+        sdf = df[df["Stock"]==stock].sort_values("Date").reset_index(drop=True)
+        n = len(sdf)
+        if n == 0: continue
+        t = int(n*TRAIN_RATIO); v = int(n*(TRAIN_RATIO+VAL_RATIO))
+        val_dfs.append(sdf.iloc[t:v])
+        test_dfs.append(sdf.iloc[v:])
+
+    val_df  = pd.concat(val_dfs, ignore_index=True) if val_dfs else pd.DataFrame()
+    test_df = pd.concat(test_dfs, ignore_index=True) if test_dfs else pd.DataFrame()
+    meta_df = pd.concat([val_df, test_df], ignore_index=True)
+
+    val_size = len(val_df)
+    test_size = len(test_df)
+    _p("✓", f"Meta stacking: val ({val_size}) + test ({test_size})")
 
     # Load base models
     try:    xgb = load_xgb()
@@ -64,31 +75,36 @@ def train():
                 _p("✓", f"{name} probabilities computed")
             except Exception as e:
                 _p("!", f"{name} predict failed: {e} — uniform fill")
-                parts.append(np.full((len(meta_df),3), 1/3))
+                parts.append(np.full((len(meta_df),2), 0.5))
         else:
-            parts.append(np.full((len(meta_df),3), 1/3))
+            parts.append(np.full((len(meta_df),2), 0.5))
 
     parts.append(_news_proba(meta_df))
     _p("✓", "News probabilities added")
 
     X_meta = np.hstack(parts)
     y_meta = meta_df["label"].values
-    mid    = len(X_meta) // 2
 
-    _p("i", "Training Logistic Regression meta-learner ...")
+    X_val, y_val = X_meta[:val_size], y_meta[:val_size]
+    X_test, y_test = X_meta[val_size:], y_meta[val_size:]
+
+    _p("i", "Training Logistic Regression meta-learner on Val data...")
     meta = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED, C=1.0)
-    meta.fit(X_meta[:mid], y_meta[:mid])
+    meta.fit(X_val, y_val)
 
-    y_pred_train  = meta.predict(X_meta[:mid])
-    y_proba_train = meta.predict_proba(X_meta[:mid])
+    y_pred_train  = meta.predict(X_val)
+    y_proba_train = meta.predict_proba(X_val)
 
-    y_pred_test  = meta.predict(X_meta[mid:])
-    y_proba_test = meta.predict_proba(X_meta[mid:])
+    y_pred_val  = meta.predict(X_val)
+    y_proba_val = meta.predict_proba(X_val)
+
+    y_pred_test  = meta.predict(X_test)
+    y_proba_test = meta.predict_proba(X_test)
     
-    # Meta learner uses half for Train, half for Validate/Test combo
-    metrics = evaluate_all(y_meta[:mid], y_pred_train, y_proba_train,
-                           y_meta[mid:], y_pred_test, y_proba_test,
-                           y_meta[mid:], y_pred_test, y_proba_test, "Ensemble")
+    # Evaluate: we treat Val as our "Train" for the meta learner
+    metrics = evaluate_all(y_val, y_pred_train, y_proba_train,
+                           y_val, y_pred_val, y_proba_val,
+                           y_test, y_pred_test, y_proba_test, "Ensemble")
 
     payload = {"meta_model":meta,"metrics":metrics}
     try:
@@ -99,7 +115,7 @@ def train():
 
     try:
         os.makedirs(os.path.dirname(ENSEMBLE_RESULTS_PATH), exist_ok=True)
-        res = meta_df.iloc[mid:][["Date","Stock","Direction"]].copy()
+        res = test_df[["Date","Stock","Direction"]].copy()
         res["Predicted"]  = y_pred_test
         res["Confidence"] = y_proba_test.max(axis=1)
         res.to_csv(ENSEMBLE_RESULTS_PATH, index=False)

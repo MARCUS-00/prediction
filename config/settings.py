@@ -45,21 +45,21 @@ EVENTS_COLS = [
 RANDOM_SEED      = 42
 TRAIN_RATIO      = 0.70
 VAL_RATIO        = 0.15
-LABEL_MAP        = {-1: 0, 0: 1, 1: 2}
-LABEL_MAP_INV    = {0: "DOWN", 1: "FLAT", 2: "UP"}
-DIRECTION_LABELS = ["DOWN", "FLAT", "UP"]
+LABEL_MAP        = {-1: 0, 1: 1}
+LABEL_MAP_INV    = {0: "DOWN", 1: "UP"}
+DIRECTION_LABELS = ["DOWN", "UP"]
 
 # ── XGBoost ───────────────────────────────────────────────────────────────────
 XGBOOST_PARAMS = {
-    "n_estimators"    : 300,
-    "max_depth"       : 4,
+    "n_estimators"    : 500,
+    "max_depth"       : 6,
     "learning_rate"   : 0.02,
     "subsample"       : 0.7,
     "colsample_bytree": 0.7,
     "gamma"           : 0.1,
     "reg_alpha"       : 0.1,
     "reg_lambda"      : 1.0,
-    "eval_metric"     : "mlogloss",
+    "eval_metric"     : "logloss",
     "random_state"    : 42,
     "n_jobs"          : -1,
 }
@@ -81,7 +81,7 @@ XGBOOST_FEATURES = [
 # ── LSTM ──────────────────────────────────────────────────────────────────────
 SEQUENCE_LENGTH = 20
 LSTM_FEATURES   = ["Close", "RSI", "MACD", "OBV", "ATR"]
-LSTM_HIDDEN     = 64
+LSTM_HIDDEN     = 128
 LSTM_LAYERS     = 2
 LSTM_DROPOUT    = 0.3
 LSTM_EPOCHS     = 50

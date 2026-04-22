@@ -11,12 +11,16 @@ def evaluate(y_true, y_pred, y_proba=None, model_name="Model", verbose=True) -> 
     acc  = accuracy_score(y_true, y_pred)
     f1_w = f1_score(y_true, y_pred, average="weighted", zero_division=0)
     f1_m = f1_score(y_true, y_pred, average="macro",    zero_division=0)
-    cm   = confusion_matrix(y_true, y_pred, labels=[0,1,2])
+    cm   = confusion_matrix(y_true, y_pred, labels=[0,1])
     rep  = classification_report(y_true, y_pred,
                                   target_names=DIRECTION_LABELS, zero_division=0)
     auc = np.nan
     if y_proba is not None:
-        try: auc = roc_auc_score(y_true, y_proba, multi_class="ovr", average="weighted")
+        try: 
+            if y_proba.shape[1] == 2: # Binary
+                auc = roc_auc_score(y_true, y_proba[:,1])
+            else:
+                auc = roc_auc_score(y_true, y_proba, multi_class="ovr", average="weighted")
         except Exception: pass
 
     if verbose:
@@ -28,7 +32,7 @@ def evaluate(y_true, y_pred, y_proba=None, model_name="Model", verbose=True) -> 
         print(f"  Macro F1    : {f1_m:.4f}")
         if not np.isnan(auc): print(f"  AUC-ROC     : {auc:.4f}")
         print(f"\n{rep}")
-        print(f"  Confusion Matrix (DOWN/FLAT/UP):\n{cm}")
+        print(f"  Confusion Matrix (DOWN/UP):\n{cm}")
         print(f"{'─'*55}\n")
 
     return {"model":model_name,"accuracy":acc,"weighted_f1":f1_w,
@@ -55,7 +59,7 @@ def evaluate_all(y_tr, p_tr, pr_tr,
     
     print(f"  [ Test Set Detailed Report ]")
     print(f"{res_te['report']}")
-    print(f"  Confusion Matrix (DOWN/FLAT/UP):")
+    print(f"  Confusion Matrix (DOWN/UP):")
     print(f"{res_te['cm']}\n")
     
     return res_te

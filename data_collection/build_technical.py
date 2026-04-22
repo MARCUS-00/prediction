@@ -99,9 +99,10 @@ def fetch_and_process(base_symbol: str) -> pd.DataFrame:
 
     df["Return_1d"] = df["Close"].pct_change()
     next_return     = df["Return_1d"].shift(-1)
-    df["Direction"] = np.select([next_return > 0, next_return < 0], [1, -1], default=0)
+    # Binary classification: >0 is UP (1), <=0 is DOWN (-1)
+    df["Direction"] = np.where(next_return > 0, 1, -1)
 
-    # Drop last row: shifted next_return is NaN → fake Direction=0
+    # Drop last row: shifted next_return is NaN
     df = df.iloc[:-1]
 
     df.reset_index(inplace=True)

@@ -182,6 +182,10 @@ def merge_all() -> pd.DataFrame:
     if not fund.empty:
         merged = merged.merge(fund, on="Stock", how="left")
         _p("✓", f"After fundamental merge: {merged.shape}")
+        
+        # Null out fundamentals for historical rows where FY25 data is anachronistic
+        merged.loc[merged["Date"] < "2024-01-01", 
+                   ["PE_Ratio","EPS","ROE","Debt_to_Equity","Revenue_Growth","Profit_Growth"]] = np.nan
     else:
         for col in ["PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
                     "Revenue_Growth", "Profit_Growth"]:

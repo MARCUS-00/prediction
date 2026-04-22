@@ -48,11 +48,21 @@ def train():
     df["label"] = df["Direction"].map(LABEL_MAP)
     df.dropna(subset=["label"], inplace=True)
     df["label"] = df["label"].astype(int)
-    df = df.sort_values("Date").reset_index(drop=True)
 
-    n = len(df)
-    t = int(n*TRAIN_RATIO); v = int(n*(TRAIN_RATIO+VAL_RATIO))
-    train_df,val_df,test_df = df.iloc[:t], df.iloc[t:v], df.iloc[v:]
+    train_dfs, val_dfs, test_dfs = [], [], []
+    for stock in df["Stock"].unique():
+        sdf = df[df["Stock"]==stock].sort_values("Date").reset_index(drop=True)
+        n = len(sdf)
+        if n == 0: continue
+        t = int(n*TRAIN_RATIO); v = int(n*(TRAIN_RATIO+VAL_RATIO))
+        train_dfs.append(sdf.iloc[:t])
+        val_dfs.append(sdf.iloc[t:v])
+        test_dfs.append(sdf.iloc[v:])
+
+    train_df = pd.concat(train_dfs, ignore_index=True) if train_dfs else pd.DataFrame()
+    val_df   = pd.concat(val_dfs, ignore_index=True) if val_dfs else pd.DataFrame()
+    test_df  = pd.concat(test_dfs, ignore_index=True) if test_dfs else pd.DataFrame()
+    
     _p("✓", f"Split — train:{len(train_df)}  val:{len(val_df)}  test:{len(test_df)}")
 
     X_train,y_train = _get_X(train_df), train_df["label"].values

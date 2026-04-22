@@ -27,10 +27,28 @@ def load_lstm():
 def predict_proba(df, payload=None):
     if payload is None: payload = load_lstm()
     tmp = df.copy()
+    tmp["__orig_idx"] = np.arange(len(tmp))
     if "label" not in tmp.columns: tmp["label"] = 1
-    X,_,_ = _build_sequences(tmp, scaler=payload["scaler"], fit_scaler=False)
-    if len(X) == 0: return np.full((len(df),3), 1/3)
-    with torch.no_grad():
-        proba = F.softmax(payload["net"](torch.tensor(X,dtype=torch.float32)),dim=1).numpy()
-    pad = np.full((len(df)-len(proba),3), 1/3)
-    return np.vstack([pad, proba])
+    
+    out_probas = np.zeros((len(tmp), 2))
+    for stock in tmp["Stock"].unique():
+        sdf = tmp[tmp["Stock"]==stock].sort_values("Date")
+        indices = sdf["__orig_idx"].values
+        
+        # `_build_sequences` doesn't take `fit_scaler` anymore in our updated file
+        try:
+            X, _ = _build_sequences(sdf, scaler=payload["scaler"])
+        except ValueError:
+            X = []
+            
+        if len(X) > 0:
+            with torch.no_grad():
+                probas = F.softmax(payload["net"](torch.tensor(X,dtype=torch.float32)),dim=1).numpy()
+            pad = np.full((len(sdf)-len(probas), 2), 0.5)
+            stock_probas = np.vstack([pad, probas])
+        else:
+            stock_probas = np.full((len(sdf), 2), 0.5)
+            
+        out_probas[indices] = stock_probas
+        
+    return out_probas
