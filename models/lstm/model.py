@@ -1,33 +1,48 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 import torch
 import torch.nn as nn
+
 from config.settings import LSTM_HIDDEN, LSTM_LAYERS, LSTM_DROPOUT
 
 
 class LSTMClassifier(nn.Module):
     """
-    Improved LSTM:
-      - BatchNorm1d on the final hidden state for training stability
-      - Separate dropout on LSTM output before fc
-      - num_classes=2  (binary: DOWN=0, UP=1)
-        FIXED: was 3 — caused silent softmax over 3 classes but only 2 labels exist
+    Attention LSTM for binary direction classification.
+
+    Attention pooling uses all sequence steps instead of only the final hidden
+    state. A projected input residual helps preserve short-horizon price action.
     """
     def __init__(self, input_size, hidden_size=LSTM_HIDDEN,
                  num_layers=LSTM_LAYERS, dropout=LSTM_DROPOUT, num_classes=2):
         super().__init__()
+        self.input_proj = nn.Linear(input_size, hidden_size)
         self.lstm = nn.LSTM(
             input_size, hidden_size, num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.bn      = nn.BatchNorm1d(hidden_size)
+        attn_hidden = max(hidden_size // 2, 16)
+        self.attn = nn.Sequential(
+            nn.Linear(hidden_size, attn_hidden),
+            nn.Tanh(),
+            nn.Linear(attn_hidden, 1),
+        )
+        self.norm = nn.LayerNorm(hidden_size)
         self.dropout = nn.Dropout(dropout)
-        self.fc      = nn.Linear(hidden_size, num_classes)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, num_classes),
+        )
 
     def forward(self, x):
         out, _ = self.lstm(x)
-        h = out[:, -1, :]          # last time-step
-        h = self.bn(h)
+        out = out + self.input_proj(x)
+        weights = torch.softmax(self.attn(out), dim=1)
+        h = (out * weights).sum(dim=1)
+        h = self.norm(h)
         h = self.dropout(h)
         return self.fc(h)

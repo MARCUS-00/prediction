@@ -34,6 +34,15 @@ def _global_date_split(df):
             df[df["Date"] >= d2].copy())
 
 
+def _date_split(df, ratio=0.5):
+    dates = sorted(df["Date"].unique())
+    if len(dates) < 2:
+        return df.copy(), df.iloc[0:0].copy()
+    cut_idx = max(1, min(len(dates) - 1, int(len(dates) * ratio)))
+    cut = dates[cut_idx]
+    return df[df["Date"] < cut].copy(), df[df["Date"] >= cut].copy()
+
+
 def _news_proba(df):
     if "news_score" in df.columns:
         score = df["news_score"].fillna(0.0).values.astype(np.float32)
@@ -47,7 +56,7 @@ def _news_proba(df):
 
 def train():
     print("\n" + "="*55)
-    print("  ENSEMBLE META-LEARNER — Training")
+    print("  ENSEMBLE META-LEARNER - Training")
     print("="*55)
 
     if not os.path.exists(MERGED_CSV):
@@ -55,7 +64,7 @@ def train():
 
     try:
         df = pd.read_csv(MERGED_CSV)
-        _p("✓", f"Loaded merged_final.csv  shape={df.shape}")
+        _p("OK", f"Loaded merged_final.csv  shape={df.shape}")
     except Exception as e:
         _p("x", f"Cannot load dataset: {e}"); return {}
 
@@ -64,9 +73,11 @@ def train():
     df["label"] = df["label"].astype(int)
     df = df.sort_values("Date").reset_index(drop=True)
 
-    # FIXED: global date split
     _, val_df, test_df = _global_date_split(df)
-    _p("✓", f"Meta-train (val): {len(val_df)}   Meta-test: {len(test_df)}")
+    meta_train_df, meta_val_df = _date_split(val_df, ratio=0.5)
+    if meta_val_df.empty:
+        meta_val_df = test_df.iloc[0:0].copy()
+    _p("OK", f"Meta-train:{len(meta_train_df)}  Meta-val:{len(meta_val_df)}  Meta-test:{len(test_df)}")
 
     try:    xgb  = load_xgb()
     except Exception as e: _p("!", f"XGBoost load failed: {e}"); xgb = None
@@ -80,18 +91,20 @@ def train():
             if payload:
                 try:
                     parts.append(fn(subset_df, payload))
-                    _p("✓", f"{name} probabilities computed for {len(subset_df)} rows")
+                    _p("OK", f"{name} probabilities computed for {len(subset_df)} rows")
                 except Exception as e:
-                    _p("!", f"{name} predict failed: {e} — uniform fill")
+                    _p("!", f"{name} predict failed: {e}; uniform fill")
                     parts.append(np.full((len(subset_df), 2), 0.5))
             else:
                 parts.append(np.full((len(subset_df), 2), 0.5))
         parts.append(_news_proba(subset_df))
         return np.hstack(parts)
 
-    X_val  = _get_parts(val_df)
+    X_meta = _get_parts(meta_train_df)
+    X_val  = _get_parts(meta_val_df) if len(meta_val_df) else X_meta
     X_test = _get_parts(test_df)
-    y_val  = val_df["label"].values
+    y_meta = meta_train_df["label"].values
+    y_val  = meta_val_df["label"].values if len(meta_val_df) else y_meta
     y_test = test_df["label"].values
 
     _p("i", "Training Logistic Regression meta-learner...")
@@ -99,16 +112,22 @@ def train():
         max_iter=2000, random_state=RANDOM_SEED, C=0.5,
         solver="lbfgs", class_weight="balanced",
     )
-    meta = CalibratedClassifierCV(base_lr, cv=3, method="isotonic")
-    meta.fit(X_val, y_val)
+    class_counts = np.bincount(y_meta, minlength=2)
+    if class_counts.min() >= 3:
+        meta = CalibratedClassifierCV(base_lr, cv=3, method="sigmoid")
+    else:
+        meta = base_lr
+    meta.fit(X_meta, y_meta)
 
+    y_pred_meta  = meta.predict(X_meta)
+    y_proba_meta = meta.predict_proba(X_meta)
     y_pred_val   = meta.predict(X_val)
     y_proba_val  = meta.predict_proba(X_val)
     y_pred_test  = meta.predict(X_test)
     y_proba_test = meta.predict_proba(X_test)
 
     metrics = evaluate_all(
-        y_val,  y_pred_val,  y_proba_val,
+        y_meta, y_pred_meta, y_proba_meta,
         y_val,  y_pred_val,  y_proba_val,
         y_test, y_pred_test, y_proba_test,
         "Ensemble"
@@ -118,7 +137,7 @@ def train():
     try:
         os.makedirs(os.path.dirname(META_MODEL_PATH), exist_ok=True)
         with open(META_MODEL_PATH, "wb") as f: pickle.dump(payload, f)
-        _p("✓", f"Model → {META_MODEL_PATH}")
+        _p("OK", f"Model -> {META_MODEL_PATH}")
     except Exception as e: _p("x", f"Save failed: {e}")
 
     try:
@@ -127,7 +146,7 @@ def train():
         res["Predicted"]  = y_pred_test
         res["Confidence"] = y_proba_test.max(axis=1)
         res.to_csv(ENSEMBLE_RESULTS_PATH, index=False)
-        _p("✓", f"Results → {ENSEMBLE_RESULTS_PATH}")
+        _p("OK", f"Results -> {ENSEMBLE_RESULTS_PATH}")
     except Exception as e: _p("!", f"Results save failed: {e}")
 
     return payload

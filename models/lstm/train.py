@@ -41,7 +41,7 @@ def _global_date_split(df):
 def _build_sequences(stock_df, scaler, feats):
     """
     Build LSTM sequences for a single stock's sorted DataFrame.
-    scaler and feats are passed explicitly — no implicit globals.
+    scaler and feats are passed explicitly; no implicit globals.
     This signature is also used by lstm/predict.py.
     """
     if not feats or len(stock_df) <= SEQUENCE_LENGTH:
@@ -69,7 +69,7 @@ def train():
     random.seed(RANDOM_SEED); np.random.seed(RANDOM_SEED); torch.manual_seed(RANDOM_SEED)
 
     print("\n" + "="*55)
-    print("  LSTM — Training")
+    print("  LSTM - Training")
     print("="*55)
 
     if not os.path.exists(MERGED_CSV):
@@ -77,7 +77,7 @@ def train():
 
     try:
         df = pd.read_csv(MERGED_CSV)
-        _p("✓", f"Loaded merged_final.csv  shape={df.shape}")
+        _p("OK", f"Loaded merged_final.csv  shape={df.shape}")
     except Exception as e:
         _p("x", f"Cannot load dataset: {e}"); return {}
 
@@ -92,7 +92,7 @@ def train():
 
     # FIXED: global date split
     train_df, val_df, test_df = _global_date_split(df)
-    _p("✓", f"Global split — train:{len(train_df)}  val:{len(val_df)}  test:{len(test_df)}")
+    _p("OK", f"Global split: train:{len(train_df)}  val:{len(val_df)}  test:{len(test_df)}")
 
     # Fit scaler on training data only
     scaler = RobustScaler()
@@ -117,16 +117,18 @@ def train():
     if not len(X_train):
         _p("x", "No sequences built."); return {}
 
-    _p("✓", f"Sequences — train:{X_train.shape}  val:{X_val.shape}  test:{X_test.shape}")
+    _p("OK", f"Sequences: train:{X_train.shape}  val:{X_val.shape}  test:{X_test.shape}")
 
     # Class weights
-    counts  = np.bincount(y_train)
-    weights = torch.tensor(1.0 / counts, dtype=torch.float32)
+    counts  = np.bincount(y_train, minlength=2)
+    weights = torch.tensor(len(y_train) / (2.0 * np.clip(counts, 1, None)), dtype=torch.float32)
 
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net       = LSTMClassifier(X_train.shape[2]).to(device)
     optimizer = Adam(net.parameters(), lr=LSTM_LR, weight_decay=1e-4)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.5)
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode="min", patience=max(8, LSTM_PATIENCE // 2), factor=0.7
+    )
     criterion = nn.CrossEntropyLoss(weight=weights.to(device))
 
     best_loss, best_state, patience_cnt = float("inf"), None, 0
@@ -140,12 +142,13 @@ def train():
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             optimizer.step()
 
-        net.eval(); vl = 0.0
+        net.eval(); vl = 0.0; val_batches = 0
         with torch.no_grad():
             for Xb, yb in _loader(X_val, y_val, LSTM_BATCH):
                 Xb, yb = Xb.to(device), yb.to(device)
                 vl += criterion(net(Xb), yb).item()
-        vl /= max(len(list(_loader(X_val, y_val, LSTM_BATCH))), 1)
+                val_batches += 1
+        vl /= max(val_batches, 1)
         scheduler.step(vl)
         print(f"    Epoch {epoch:02d}/{LSTM_EPOCHS}  val_loss={vl:.4f}  "
               f"patience={patience_cnt}/{LSTM_PATIENCE}  "
@@ -179,12 +182,12 @@ def train():
 
     try:
         torch.save(net.state_dict(), LSTM_MODEL_PATH)
-        _p("✓", f"Model → {LSTM_MODEL_PATH}")
+        _p("OK", f"Model -> {LSTM_MODEL_PATH}")
     except Exception as e: _p("x", f"Save failed: {e}")
 
     try:
         with open(LSTM_SCALER_PATH, "wb") as f: pickle.dump(scaler, f)
-        _p("✓", f"Scaler → {LSTM_SCALER_PATH}")
+        _p("OK", f"Scaler -> {LSTM_SCALER_PATH}")
     except Exception as e: _p("x", f"Scaler save failed: {e}")
 
     feat_path = LSTM_SCALER_PATH.replace("lstm_scaler.pkl", "lstm_features.pkl")

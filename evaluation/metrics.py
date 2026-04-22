@@ -24,16 +24,16 @@ def evaluate(y_true, y_pred, y_proba=None, model_name="Model", verbose=True) -> 
         except Exception: pass
 
     if verbose:
-        print(f"\n{'─'*55}")
+        print(f"\n{'-'*55}")
         print(f"  {model_name} Results")
-        print(f"{'─'*55}")
+        print(f"{'-'*55}")
         print(f"  Accuracy    : {acc:.4f}")
         print(f"  Weighted F1 : {f1_w:.4f}")
         print(f"  Macro F1    : {f1_m:.4f}")
         if not np.isnan(auc): print(f"  AUC-ROC     : {auc:.4f}")
         print(f"\n{rep}")
         print(f"  Confusion Matrix (DOWN/UP):\n{cm}")
-        print(f"{'─'*55}\n")
+        print(f"{'-'*55}\n")
 
     return {"model":model_name,"accuracy":acc,"weighted_f1":f1_w,
             "macro_f1":f1_m,"auc_roc":auc,"report":rep, "cm": cm}
@@ -47,7 +47,7 @@ def evaluate_all(y_tr, p_tr, pr_tr,
     res_te = evaluate(y_te, p_te, pr_te, verbose=False)
     
     print(f"\n{'='*65}")
-    print(f"  {model_name.upper()} — EVALUATION SUMMARY")
+    print(f"  {model_name.upper()} - EVALUATION SUMMARY")
     print(f"{'='*65}")
     print(f"  Metric       | Train Set  | Val Set    | Test Set")
     print(f"  -------------+------------+------------+------------")

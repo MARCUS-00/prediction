@@ -45,41 +45,90 @@ LABEL_MAP        = {-1: 0, 1: 1}
 LABEL_MAP_INV    = {0: "DOWN", 1: "UP"}
 DIRECTION_LABELS = ["DOWN", "UP"]
 
+# Deterministic sector map for the 40-stock universe used by the builders.
+# Keep the raw Sector column for display, and use one-hot Sector_* columns for
+# models so XGBoost never receives categorical strings.
+SECTOR_MAP = {
+    "HDFCBANK": "Financial_Services",
+    "ICICIBANK": "Financial_Services",
+    "SBIN": "Financial_Services",
+    "AXISBANK": "Financial_Services",
+    "KOTAKBANK": "Financial_Services",
+    "BAJFINANCE": "Financial_Services",
+    "BAJAJFINSV": "Financial_Services",
+    "INDUSINDBK": "Financial_Services",
+    "TCS": "Information_Technology",
+    "INFY": "Information_Technology",
+    "HCLTECH": "Information_Technology",
+    "WIPRO": "Information_Technology",
+    "TECHM": "Information_Technology",
+    "RELIANCE": "Energy",
+    "ONGC": "Energy",
+    "NTPC": "Utilities",
+    "POWERGRID": "Utilities",
+    "BPCL": "Energy",
+    "HINDUNILVR": "Consumer_Staples",
+    "ITC": "Consumer_Staples",
+    "NESTLEIND": "Consumer_Staples",
+    "BRITANNIA": "Consumer_Staples",
+    "MARUTI": "Automobile",
+    "M&M": "Automobile",
+    "BHARTIARTL": "Telecom",
+    "EICHERMOT": "Automobile",
+    "HEROMOTOCO": "Automobile",
+    "BAJAJ-AUTO": "Automobile",
+    "SUNPHARMA": "Pharma",
+    "CIPLA": "Pharma",
+    "DRREDDY": "Pharma",
+    "TATASTEEL": "Metals",
+    "JSWSTEEL": "Metals",
+    "HINDALCO": "Metals",
+    "COALINDIA": "Energy",
+    "LT": "Industrials",
+    "ULTRACEMCO": "Cement",
+    "GRASIM": "Cement",
+    "ASIANPAINT": "Consumer_Durables",
+    "TITAN": "Consumer_Durables",
+}
+SECTOR_NAMES = sorted(set(SECTOR_MAP.values()))
+SECTOR_TO_CODE = {name: i for i, name in enumerate(SECTOR_NAMES)}
+SECTOR_FEATURES = [f"Sector_{name}" for name in SECTOR_NAMES]
+
 # ── XGBoost ───────────────────────────────────────────────────────────────────
 XGBOOST_PARAMS = {
-    "n_estimators"    : 800,
-    "max_depth"       : 5,
-    "learning_rate"   : 0.01,
-    "subsample"       : 0.8,
+    "n_estimators": 300,
+    "max_depth": 3,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
     "colsample_bytree": 0.6,
-    "min_child_weight": 5,
-    "gamma"           : 0.2,
-    "reg_alpha"       : 0.5,
-    "reg_lambda"      : 2.0,
-    "eval_metric"     : "logloss",
-    "random_state"    : 42,
-    "n_jobs"          : -1,
+    "min_child_weight": 10,
+    "eval_metric": "logloss",
+    "random_state": 42,
+    "n_jobs": -1,
+    "tree_method": "hist",
 }
 
 XGBOOST_FEATURES = [
     # OHLCV
     "Open", "High", "Low", "Close", "Volume",
     # Base indicators
-    "EMA_20", "RSI", "MACD", "MACD_signal", "ATR", "OBV", "Return_1d",
+    "EMA_9", "EMA_20", "EMA_50", "RSI", "MACD", "MACD_signal", "MACD_hist",
+    "ATR", "ATR_ratio", "Return_1d",
     # Lags
     "Close_lag1","Close_lag2","Close_lag3","Close_lag5",
-    "RSI_lag1","MACD_lag1","OBV_lag1","Return_1d_lag1",
+    "RSI_lag1","MACD_lag1","Return_1d_lag1",
     # Rolling
     "Close_roll_mean_5","Close_roll_std_5",
     "Close_roll_mean_10","Close_roll_std_10",
     "Close_roll_mean_20","Close_roll_std_20",
     # Derived technical
     "BB_pct","Volume_ratio","Momentum_5d","Momentum_10d",
-    "EMA_dist","RSI_overbought","RSI_oversold",
+    "EMA_dist","EMA_dist_50","RSI_overbought","RSI_oversold",
+    "RSI_change","OBV_change","volume_shock","price_accel","EMA_cross_9_20",
     # Cross-sectional (highest-signal new features)
-    "CS_momentum_rank","CS_volume_rank","CS_rsi_rank",
+    "CS_momentum_rank","CS_volume_rank","CS_rsi_rank","CS_atr_rank",
     # Regime & context
-    "streak_lag1","pct_from_52w_high",
+    "pct_from_52w_high","pct_from_52w_low","sector_encoded",
     "market_vol_20d","intraday_range","gap_pct",
     # Fundamental
     "PE_Ratio","EPS","ROE","Debt_to_Equity",
@@ -87,15 +136,15 @@ XGBOOST_FEATURES = [
     # Events
     "event_score_max","event_count","is_event",
     # News
-    "news_score","news_positive","news_negative",
+    "news_score","news_score_5d","news_positive","news_negative","news_count","has_news",
 ]
 
 # ── LSTM ──────────────────────────────────────────────────────────────────────
-SEQUENCE_LENGTH = 30
+SEQUENCE_LENGTH = 20
 LSTM_FEATURES   = [
-    "Close","RSI","MACD","OBV","ATR",
+    "Close","RSI","RSI_change","MACD","MACD_hist","ATR","ATR_ratio",
     "Return_1d","EMA_dist","BB_pct","Volume_ratio",
-    "Momentum_5d","news_score",
+    "Momentum_5d","OBV_change","news_score","news_score_5d","has_news",
     "CS_momentum_rank","CS_rsi_rank","market_vol_20d",
 ]
 LSTM_HIDDEN     = 128

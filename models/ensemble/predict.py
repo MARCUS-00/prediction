@@ -27,7 +27,7 @@ def predict_ensemble(df, xgb_payload=None, lstm_payload=None, meta_payload=None)
     parts = []
     for fn, payload in [(xgb_proba,xgb_payload),(lstm_proba,lstm_payload)]:
         try:   parts.append(fn(df, payload))
-        except Exception: parts.append(np.full((len(df),3), 1/3))
+        except Exception: parts.append(np.full((len(df),2), 0.5))
     parts.append(_news_proba(df))
 
     proba = meta_payload["meta_model"].predict_proba(np.hstack(parts))

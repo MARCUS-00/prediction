@@ -2,8 +2,8 @@
 # build_technical.py  (FIXED + IMPROVED)
 #
 # Key change: PREDICTION_HORIZON controls whether we predict
-# 1-day or 5-day direction. Set to 5 for significantly better
-# accuracy (~52-59% vs ~51%) due to reduced daily noise.
+# 1-day or 5-day direction. The fixed merge no longer uses
+# future-derived streak features, so existing 5-day data can be reused.
 # ============================================================
 
 import os, sys, time
@@ -16,7 +16,7 @@ from contextlib import contextmanager
 START_DATE  = "2015-01-01"
 END_DATE    = "2025-12-31"
 STOCK_COUNT = 40
-PREDICTION_HORIZON = 5   # ← change to 1 for next-day, 5 for next-week
+PREDICTION_HORIZON = 1
 
 _BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUTPUT_DIR  = os.path.join(_BASE_DIR, "data", "technical")
@@ -121,7 +121,7 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print("=" * 60)
     print("  BUILD TECHNICAL DATASET")
-    print(f"  Date range         : {START_DATE} → {END_DATE}")
+    print(f"  Date range         : {START_DATE} -> {END_DATE}")
     print(f"  Prediction horizon : {PREDICTION_HORIZON} day(s)")
     print(f"  Stocks             : {len(STOCKS)}")
     print(f"  Output             : {OUTPUT_FILE}")
@@ -162,9 +162,9 @@ def main():
 
     pos_rate = (final["Direction"] == 1).mean()
     print("\n" + "=" * 60)
-    print(f"  ✅ Saved → {OUTPUT_FILE}")
+    print(f"  [OK] Saved -> {OUTPUT_FILE}")
     print(f"     Shape      : {final.shape}")
-    print(f"     Date range : {final['Date'].min()} → {final['Date'].max()}")
+    print(f"     Date range : {final['Date'].min()} -> {final['Date'].max()}")
     print(f"     Stocks     : {final['Stock'].nunique()}  "
           f"(success={success}, skip={skipped})")
     print(f"     Direction  : UP={pos_rate:.1%}  DOWN={1-pos_rate:.1%}")

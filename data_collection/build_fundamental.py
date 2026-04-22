@@ -4,6 +4,7 @@
 # ============================================================
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -18,6 +19,10 @@ END_YEAR         = 2025
 STOCK_COUNT      = 40
 
 BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, BASE_DIR)
+
+from config.settings import SECTOR_MAP
+
 OUTPUT_DIR = os.path.join(BASE_DIR, "data", "fundamental")
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "fundamental.csv")
 
@@ -124,6 +129,7 @@ def get_stock_data(stock):
             data.append({
                 "Stock": base,
                 "Year": year,
+                "Sector": SECTOR_MAP.get(base, "Unknown"),
                 "PE_Ratio": pe,
                 "EPS": eps,
                 "ROE": roe,
@@ -135,7 +141,7 @@ def get_stock_data(stock):
             })
 
     except Exception as e:
-        print(f"  ❌ Error {stock}: {e}")
+        print(f"  [ERROR] {stock}: {e}")
 
     return data
 
@@ -146,24 +152,25 @@ def expand_years(df):
     final = []
 
     for stock in df["Stock"].unique():
-        sub = df[df["Stock"] == stock].copy()
+        sub = df[df["Stock"] == stock].copy().sort_values("Year")
+        sub["Revenue_Growth"] = sub["Revenue"].pct_change()
+        sub["Profit_Growth"] = sub["Profit"].pct_change()
 
         full = pd.DataFrame({"Year": range(START_YEAR, END_YEAR+1)})
         sub = full.merge(sub, on="Year", how="left")
 
         sub["Stock"] = stock
+        sub["Sector"] = sub["Sector"].fillna(SECTOR_MAP.get(stock, "Unknown"))
         sub = sub.sort_values("Year")
 
+        growth_cols = ["Revenue_Growth", "Profit_Growth"]
+        growth = sub[growth_cols].copy()
         sub = sub.ffill()
-        sub = sub.bfill()
+        sub[growth_cols] = growth.ffill()
 
         final.append(sub)
 
     df = pd.concat(final).sort_values(["Stock","Year"])
-
-    # ✅ recompute growth properly
-    df["Revenue_Growth"] = df.groupby("Stock")["Revenue"].pct_change()
-    df["Profit_Growth"] = df.groupby("Stock")["Profit"].pct_change()
 
     return df
 
@@ -195,7 +202,7 @@ def main():
             print("✘")
 
     if not dataset:
-        print("\n❌ No data collected")
+        print("\n[ERROR] No data collected")
         return
 
     df = pd.DataFrame(dataset)
@@ -206,7 +213,7 @@ def main():
     df.to_csv(OUTPUT_FILE, index=False)
 
     print("\n" + "="*60)
-    print(f"✅ Saved → {OUTPUT_FILE}")
+    print(f"[OK] Saved -> {OUTPUT_FILE}")
     print(f"✔ Success: {success} stocks")
     print(f"✘ Skipped: {skipped} stocks")
     print(f"📊 Total rows: {len(df)}")

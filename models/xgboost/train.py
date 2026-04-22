@@ -45,7 +45,7 @@ def _global_date_split(df):
     train = df[df["Date"] <  d1].copy()
     val   = df[(df["Date"] >= d1) & (df["Date"] < d2)].copy()
     test  = df[df["Date"] >= d2].copy()
-    _p("✓", f"Global date split — train<{d1}  val[{d1},{d2})  test≥{d2}")
+    _p("OK", f"Global date split: train<{d1}  val[{d1},{d2})  test>={d2}")
     return train, val, test
 
 
@@ -63,7 +63,7 @@ def train():
     random.seed(RANDOM_SEED); np.random.seed(RANDOM_SEED)
 
     print("\n" + "="*55)
-    print("  XGBOOST — Training")
+    print("  XGBOOST - Training")
     print("="*55)
 
     try:
@@ -77,7 +77,7 @@ def train():
 
     try:
         df = pd.read_csv(MERGED_CSV)
-        _p("✓", f"Loaded merged_final.csv  shape={df.shape}")
+        _p("OK", f"Loaded merged_final.csv  shape={df.shape}")
     except Exception as e:
         _p("x", f"Cannot load dataset: {e}"); return {}
 
@@ -88,7 +88,7 @@ def train():
 
     # FIXED: global date split instead of per-stock split
     train_df, val_df, test_df = _global_date_split(df)
-    _p("✓", f"Split — train:{len(train_df)}  val:{len(val_df)}  test:{len(test_df)}")
+    _p("OK", f"Split: train:{len(train_df)}  val:{len(val_df)}  test:{len(test_df)}")
 
     X_train, y_train = _get_X(train_df), train_df["label"].values
     X_val,   y_val   = _get_X(val_df),   val_df["label"].values
@@ -124,7 +124,7 @@ def train():
     try:
         os.makedirs(os.path.dirname(XGB_MODEL_PATH), exist_ok=True)
         with open(XGB_MODEL_PATH, "wb") as f: pickle.dump(payload, f)
-        _p("✓", f"Model → {XGB_MODEL_PATH}")
+        _p("OK", f"Model -> {XGB_MODEL_PATH}")
     except Exception as e:
         _p("x", f"Save failed: {e}")
 
@@ -134,7 +134,7 @@ def train():
         res["Predicted"]  = y_pred_test
         res["Confidence"] = y_proba_test.max(axis=1)
         res.to_csv(XGB_RESULTS_PATH, index=False)
-        _p("✓", f"Results → {XGB_RESULTS_PATH}")
+        _p("OK", f"Results -> {XGB_RESULTS_PATH}")
     except Exception as e:
         _p("!", f"Results save failed: {e}")
 

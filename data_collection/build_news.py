@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")
 START_DATE  = "2015-01-01"
 END_DATE    = "2025-12-31"
 STOCK_COUNT = 40
-MAX_ARTICLES_PER_STOCK  = 150
+MAX_ARTICLES_PER_STOCK  = 1000
 MIN_ARTICLES_THRESHOLD  = 2
 
 FY_START = pd.to_datetime(START_DATE)
@@ -202,7 +202,7 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print("=" * 60)
     print("  BUILD NEWS DATASET")
-    print(f"  Date range : {START_DATE} → {END_DATE}")
+    print(f"  Date range : {START_DATE} -> {END_DATE}")
     print(f"  Stocks     : {len(STOCKS)}")
     print(f"  Output     : {OUTPUT_FILE}")
     print("=" * 60)
@@ -240,9 +240,9 @@ def main():
     df_clean[cols_to_save].to_csv(OUTPUT_FILE, index=False)
 
     print("\n" + "=" * 60)
-    print(f"  ✅ Saved → {OUTPUT_FILE}")
+    print(f"  [OK] Saved -> {OUTPUT_FILE}")
     print(f"     Articles   : {len(df_clean)}")
-    print(f"     Date range : {df_clean['Date'].min()} → {df_clean['Date'].max()}")
+    print(f"     Date range : {df_clean['Date'].min()} -> {df_clean['Date'].max()}")
     print(f"     Stocks     : {', '.join(successful)}")
     print("=" * 60)
 

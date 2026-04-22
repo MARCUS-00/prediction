@@ -12,21 +12,21 @@ def _p(tag, msg): print(f"  [{tag}] {msg}")
 
 def generate_watchlist(df: pd.DataFrame = None) -> pd.DataFrame:
     print("\n" + "="*55)
-    print("  WATCHLIST — Daily Predictions")
+    print("  WATCHLIST - Daily Predictions")
     print("="*55)
 
     if df is None or df.empty:
         if not os.path.exists(MERGED_CSV):
-            _p("✗", "merged_final.csv not found. Run: python features/merge_features.py")
+            _p("x", "merged_final.csv not found. Run: python features/merge_features.py")
             return pd.DataFrame()
         try: df = pd.read_csv(MERGED_CSV)
         except Exception as e:
-            _p("✗", f"Cannot load dataset: {e}"); return pd.DataFrame()
+            _p("x", f"Cannot load dataset: {e}"); return pd.DataFrame()
 
     try:
         xgb_p=load_xgb(); lstm_p=load_lstm(); meta_p=load_meta()
     except Exception as e:
-        _p("✗", f"Model load failed: {e}"); return pd.DataFrame()
+        _p("x", f"Model load failed: {e}"); return pd.DataFrame()
 
     stocks  = df["Stock"].unique().tolist()
     records = []
@@ -56,7 +56,7 @@ def generate_watchlist(df: pd.DataFrame = None) -> pd.DataFrame:
             _p("!", f"{sym} failed: {e}")
 
     if not records:
-        _p("✗", "No predictions generated"); return pd.DataFrame()
+        _p("x", "No predictions generated"); return pd.DataFrame()
 
     wl = pd.DataFrame(records)
     wl.sort_values("_conf", ascending=False, inplace=True)
@@ -66,7 +66,7 @@ def generate_watchlist(df: pd.DataFrame = None) -> pd.DataFrame:
     try:
         os.makedirs(os.path.dirname(WATCHLIST_OUTPUT_PATH), exist_ok=True)
         wl.to_csv(WATCHLIST_OUTPUT_PATH, index=False)
-        _p("✓", f"Saved → {WATCHLIST_OUTPUT_PATH}")
+        _p("OK", f"Saved -> {WATCHLIST_OUTPUT_PATH}")
     except Exception as e:
         _p("!", f"Save failed: {e}")
 

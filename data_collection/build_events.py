@@ -131,7 +131,7 @@ def fetch_corporate_events(symbol: str, start_date: str, end_date: str) -> list:
         time.sleep(0.5)
 
     if len(events) < 5:
-        print(f" [WARN: {len(events)} API events → fallback]", end="")
+        print(f" [WARN: {len(events)} API events -> fallback]", end="")
         events.extend(_build_fallback_events(symbol, start_date, end_date))
 
     print(f" [DONE: {len(events)} events]")
@@ -187,7 +187,7 @@ def main():
 
     print("=" * 60)
     print(f"  BUILD EVENTS DATASET")
-    print(f"  Date range       : {START_DATE} → {END_DATE}")
+    print(f"  Date range       : {START_DATE} -> {END_DATE}")
     print(f"  Stocks           : {len(STOCKS)}")
     print(f"  RBI policy dates : {len(RBI_POLICY_DATES)} in range")
     print(f"  Repo rate dates  : {len(REPO_RATE_DATES)} in range")
@@ -269,10 +269,10 @@ def main():
     df.to_csv(OUTPUT_FILE, index=False)
 
     print("\n" + "=" * 60)
-    print(f"  ✅ Saved → {OUTPUT_FILE}")
+    print(f"  [OK] Saved -> {OUTPUT_FILE}")
     print(f"     Rows        : {len(df)}")
     print(f"     Event-days  : {df['is_event'].sum()}")
-    print(f"     Date range  : {df['date'].min()} → {df['date'].max()}")
+    print(f"     Date range  : {df['date'].min()} -> {df['date'].max()}")
     print("=" * 60)
 
 
