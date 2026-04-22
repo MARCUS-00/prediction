@@ -30,9 +30,21 @@ TECHNICAL_COLS = [
     "EMA_20", "RSI", "MACD", "ATR", "OBV", "Return_1d", "Direction",
 ]
 
-FUNDAMENTAL_FY_PREFIXES = ["PE_Ratio_FY", "EPS_FY", "ROE_FY", "Debt_to_Equity_FY"]
-FUNDAMENTAL_BASE_COLS   = ["PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
-                            "Revenue_Growth", "Profit_Growth"]
+# ❌ OLD FY-style not needed anymore (you can keep or remove safely)
+FUNDAMENTAL_FY_PREFIXES = ["PE_Ratio", "EPS", "ROE", "Debt_to_Equity"]
+
+# ✅ FIXED (added Revenue & Profit)
+FUNDAMENTAL_BASE_COLS = [
+    "Year",
+    "PE_Ratio",
+    "EPS",
+    "ROE",
+    "Debt_to_Equity",
+    "Revenue",
+    "Profit",
+    "Revenue_Growth",
+    "Profit_Growth"
+]
 
 NEWS_COLS = ["Date", "Stock", "News_Text", "Source"]
 
@@ -72,8 +84,13 @@ XGBOOST_FEATURES = [
     "Close_roll_mean_5", "Close_roll_std_5",
     "Close_roll_mean_10", "Close_roll_std_10",
     "Close_roll_mean_20", "Close_roll_std_20",
+
+    # ✅ FUNDAMENTAL FEATURES
     "PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
+    "Revenue", "Profit",
     "Revenue_Growth", "Profit_Growth",
+
+    # Events + News
     "event_score_max", "event_count", "is_event",
     "news_positive", "news_neutral", "news_negative",
 ]
