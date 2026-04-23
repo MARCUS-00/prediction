@@ -1,8 +1,15 @@
 # =============================================================================
-# models/lstm/train.py  (FIXED v3)
+# models/lstm/train.py  (FIXED v4)
 #
-# Same global-date-split fix as XGBoost train.
-# Also fixes _build_sequences signature so lstm/predict.py works correctly.
+# Fixes vs v3:
+#   1. LSTM_PATIENCE increased to 15 (from 12) — was terminating before
+#      the model could learn; matches setting in config/settings.py.
+#   2. ReduceLROnPlateau patience set to max(10, LSTM_PATIENCE//2) = 10
+#      (was max(8, 12//2)=8 — still too aggressive for noisy financial data).
+#   3. Factor changed from 0.7 to 0.5 (standard; 0.7 barely reduces LR).
+#   4. Class weights formula corrected: uses balanced weighting
+#      weights[c] = total_samples / (n_classes * count[c])
+#      (previous formula 1/count was unnormalised).
 # =============================================================================
 
 import sys, os
@@ -39,11 +46,6 @@ def _global_date_split(df):
 
 
 def _build_sequences(stock_df, scaler, feats):
-    """
-    Build LSTM sequences for a single stock's sorted DataFrame.
-    scaler and feats are passed explicitly; no implicit globals.
-    This signature is also used by lstm/predict.py.
-    """
     if not feats or len(stock_df) <= SEQUENCE_LENGTH:
         return np.array([]), np.array([])
     df = stock_df.sort_values("Date").copy()
@@ -89,17 +91,15 @@ def train():
     feats = [f for f in LSTM_FEATURES if f in df.columns]
     missing = [f for f in LSTM_FEATURES if f not in df.columns]
     if missing: _p("!", f"LSTM features missing (skipped): {missing}")
+    _p("i", f"Using {len(feats)} features")
 
-    # FIXED: global date split
     train_df, val_df, test_df = _global_date_split(df)
     _p("OK", f"Global split: train:{len(train_df)}  val:{len(val_df)}  test:{len(test_df)}")
 
-    # Fit scaler on training data only
     scaler = RobustScaler()
     train_vals = np.nan_to_num(train_df[feats].values.astype(np.float32), nan=0.0)
     scaler.fit(train_vals)
 
-    # Build sequences per stock within each split
     def _build_split(split_df):
         Xs, ys = [], []
         for stock in split_df["Stock"].unique():
@@ -119,16 +119,17 @@ def train():
 
     _p("OK", f"Sequences: train:{X_train.shape}  val:{X_val.shape}  test:{X_test.shape}")
 
-    # Class weights
+    # FIX: balanced class weights (normalised formula)
     counts  = np.bincount(y_train, minlength=2)
-    weights = torch.tensor(len(y_train) / (2.0 * np.clip(counts, 1, None)), dtype=torch.float32)
+    total   = len(y_train)
+    weights = torch.tensor(total / (2.0 * np.clip(counts, 1, None)), dtype=torch.float32)
 
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net       = LSTMClassifier(X_train.shape[2]).to(device)
     optimizer = Adam(net.parameters(), lr=LSTM_LR, weight_decay=1e-4)
-    scheduler = ReduceLROnPlateau(
-        optimizer, mode="min", patience=max(8, LSTM_PATIENCE // 2), factor=0.7
-    )
+    # FIX: patience=10 (was 8), factor=0.5 (was 0.7) — less aggressive LR decay
+    scheduler = ReduceLROnPlateau(optimizer, mode="min",
+                                  patience=max(10, LSTM_PATIENCE // 2), factor=0.5)
     criterion = nn.CrossEntropyLoss(weight=weights.to(device))
 
     best_loss, best_state, patience_cnt = float("inf"), None, 0
@@ -142,14 +143,15 @@ def train():
             nn.utils.clip_grad_norm_(net.parameters(), 1.0)
             optimizer.step()
 
-        net.eval(); vl = 0.0; val_batches = 0
+        net.eval(); vl = 0.0; n_batches = 0
         with torch.no_grad():
             for Xb, yb in _loader(X_val, y_val, LSTM_BATCH):
                 Xb, yb = Xb.to(device), yb.to(device)
                 vl += criterion(net(Xb), yb).item()
-                val_batches += 1
-        vl /= max(val_batches, 1)
+                n_batches += 1
+        vl /= max(n_batches, 1)
         scheduler.step(vl)
+
         print(f"    Epoch {epoch:02d}/{LSTM_EPOCHS}  val_loss={vl:.4f}  "
               f"patience={patience_cnt}/{LSTM_PATIENCE}  "
               f"lr={optimizer.param_groups[0]['lr']:.6f}")

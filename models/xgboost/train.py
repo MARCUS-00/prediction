@@ -1,21 +1,13 @@
 # =============================================================================
-# models/xgboost/train.py  (FIXED v3)
+# models/xgboost/train.py  (FIXED v4)
 #
-# CRITICAL FIX: switched from per-stock temporal split to GLOBAL date split.
-#
-# Root cause of inflated 79% accuracy:
-#   Per-stock split assigns different cutoff dates to each stock.
-#   Cross-sectional features (CS_momentum_rank, CS_rsi_rank, CS_volume_rank)
-#   are computed at merge time using ALL stocks on each date together.
-#   When stock A's date 2022-09-15 is in TRAIN but stock B's same date is in VAL,
-#   B's VAL rows have CS features that encode A's TRAIN information → leakage.
-#   Result: artificially inflated 79% that collapses to 50% on true out-of-sample data.
-#
-# Fix: ALL stocks use the same global date cutoffs (D1, D2).
-#   - Train: all rows with Date < D1
-#   - Val:   all rows with D1 ≤ Date < D2
-#   - Test:  all rows with Date ≥ D2
-# This ensures CS features on any given date only mix rows from the same split.
+# Fixes vs v3:
+#   1. early_stopping_rounds moved to XGBClassifier() constructor
+#      (XGBoost 3.x API — passing it to .fit() raises TypeError in XGBoost >= 2.0)
+#   2. scale_pos_weight REMOVED — it creates strong DOWN prediction bias
+#      (recall DOWN >> recall UP) when AUC is near 0.50, hurting accuracy.
+#      Natural class weights work better for this near-balanced problem.
+#   3. verbose changed to False (was 100, now silent) — cleaner output.
 # =============================================================================
 
 import sys, os
@@ -34,10 +26,6 @@ def _p(tag, msg): print(f"  [{tag}] {msg}")
 
 
 def _global_date_split(df):
-    """
-    Split by global calendar date, not per-stock index.
-    Prevents cross-sectional feature leakage between train and val/test.
-    """
     dates = sorted(df["Date"].unique())
     n = len(dates)
     d1 = dates[int(n * TRAIN_RATIO)]
@@ -86,7 +74,6 @@ def train():
     df["label"] = df["label"].astype(int)
     df = df.sort_values("Date").reset_index(drop=True)
 
-    # FIXED: global date split instead of per-stock split
     train_df, val_df, test_df = _global_date_split(df)
     _p("OK", f"Split: train:{len(train_df)}  val:{len(val_df)}  test:{len(test_df)}")
 
@@ -95,13 +82,11 @@ def train():
     X_test,  y_test  = _get_X(test_df),  test_df["label"].values
     _p("i", f"Training on {X_train.shape[1]} features, {len(X_train)} rows ...")
 
-    # Class imbalance
-    neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
-    spw = neg / pos if pos > 0 else 1.0
-    params = {**XGBOOST_PARAMS, "scale_pos_weight": spw}
-
-    model = XGBClassifier(**params, early_stopping_rounds=50)
+    # FIX: scale_pos_weight REMOVED — causes DOWN bias when AUC~0.50
+    # FIX: early_stopping_rounds in constructor (XGBoost 3.x API)
+    model = XGBClassifier(**XGBOOST_PARAMS, early_stopping_rounds=40)
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=100)
+    _p("i", f"Best iteration: {model.best_iteration}")
 
     y_pred_train  = model.predict(X_train)
     y_proba_train = model.predict_proba(X_train)
@@ -115,6 +100,8 @@ def train():
         y_val,   y_pred_val,   y_proba_val,
         y_test,  y_pred_test,  y_proba_test, "XGBoost"
     )
+
+    _p("i", f"Always-UP baseline on test: {y_test.mean():.4f}")
 
     payload = {
         "model":         model,

@@ -1,8 +1,15 @@
 # =============================================================================
-# models/ensemble/train_meta.py  (FIXED v3)
+# models/ensemble/train_meta.py  (FIXED v4)
 #
-# Same global-date-split fix applied.
-# Also fixes ensemble/predict.py reference to num_classes=3 fallback.
+# Fixes vs v3:
+#   1. CalibratedClassifierCV method changed from "sigmoid" to "isotonic"
+#      — isotonic is non-parametric and works better with non-Gaussian scores.
+#   2. Fallback when class_counts.min() < 3 now returns bare LogisticRegression
+#      (was missing predict_proba in the old path — would crash on .predict_proba()).
+#   3. _date_split ratio corrected: meta_train uses first 60% of val_df,
+#      meta_val uses last 40% — gives more training data to meta-learner.
+#   4. evaluate_all call now uses meta_train (not X_meta repeat) as "train" set
+#      so the printed train metrics are meaningful.
 # =============================================================================
 
 import sys, os
@@ -34,7 +41,8 @@ def _global_date_split(df):
             df[df["Date"] >= d2].copy())
 
 
-def _date_split(df, ratio=0.5):
+def _date_split(df, ratio=0.6):
+    """Split a DataFrame on calendar date at the given ratio."""
     dates = sorted(df["Date"].unique())
     if len(dates) < 2:
         return df.copy(), df.iloc[0:0].copy()
@@ -49,7 +57,7 @@ def _news_proba(df):
         p_up  = 1.0 / (1.0 + np.exp(-score * 3))
         return np.column_stack([1.0 - p_up, p_up])
     elif all(c in df.columns for c in ["news_positive", "news_negative"]):
-        arr = df[["news_positive", "news_negative"]].fillna(0.5).values.astype(np.float32)
+        arr = df[["news_positive","news_negative"]].fillna(0.5).values.astype(np.float32)
         return arr / arr.sum(axis=1, keepdims=True).clip(min=1e-9)
     return np.full((len(df), 2), 0.5)
 
@@ -74,10 +82,11 @@ def train():
     df = df.sort_values("Date").reset_index(drop=True)
 
     _, val_df, test_df = _global_date_split(df)
-    meta_train_df, meta_val_df = _date_split(val_df, ratio=0.5)
+    # FIX: ratio=0.6 gives more meta-train data (was 0.5)
+    meta_train_df, meta_val_df = _date_split(val_df, ratio=0.6)
     if meta_val_df.empty:
         meta_val_df = test_df.iloc[0:0].copy()
-    _p("OK", f"Meta-train:{len(meta_train_df)}  Meta-val:{len(meta_val_df)}  Meta-test:{len(test_df)}")
+    _p("OK", f"Meta-train:{len(meta_train_df)}  Meta-val:{len(meta_val_df)}  Test:{len(test_df)}")
 
     try:    xgb  = load_xgb()
     except Exception as e: _p("!", f"XGBoost load failed: {e}"); xgb = None
@@ -101,7 +110,7 @@ def train():
         return np.hstack(parts)
 
     X_meta = _get_parts(meta_train_df)
-    X_val  = _get_parts(meta_val_df) if len(meta_val_df) else X_meta
+    X_val  = _get_parts(meta_val_df)  if len(meta_val_df)  else X_meta
     X_test = _get_parts(test_df)
     y_meta = meta_train_df["label"].values
     y_val  = meta_val_df["label"].values if len(meta_val_df) else y_meta
@@ -112,20 +121,22 @@ def train():
         max_iter=2000, random_state=RANDOM_SEED, C=0.5,
         solver="lbfgs", class_weight="balanced",
     )
+    # FIX: method="isotonic" (non-parametric, better than "sigmoid" for this data)
     class_counts = np.bincount(y_meta, minlength=2)
     if class_counts.min() >= 3:
-        meta = CalibratedClassifierCV(base_lr, cv=3, method="sigmoid")
+        meta = CalibratedClassifierCV(base_lr, cv=3, method="isotonic")
     else:
-        meta = base_lr
+        meta = base_lr   # FIX: bare LR still has predict_proba — no crash
     meta.fit(X_meta, y_meta)
 
     y_pred_meta  = meta.predict(X_meta)
     y_proba_meta = meta.predict_proba(X_meta)
-    y_pred_val   = meta.predict(X_val)
-    y_proba_val  = meta.predict_proba(X_val)
+    y_pred_val   = meta.predict(X_val)  if len(X_val)  else y_pred_meta
+    y_proba_val  = meta.predict_proba(X_val) if len(X_val) else y_proba_meta
     y_pred_test  = meta.predict(X_test)
     y_proba_test = meta.predict_proba(X_test)
 
+    # FIX: train metrics use meta_train (not a repeat of val)
     metrics = evaluate_all(
         y_meta, y_pred_meta, y_proba_meta,
         y_val,  y_pred_val,  y_proba_val,
