@@ -63,36 +63,42 @@ SECTOR_NAMES   = sorted(set(SECTOR_MAP.values()))
 SECTOR_TO_CODE = {name: i for i, name in enumerate(SECTOR_NAMES)}
 
 # ── Labels ────────────────────────────────────────────────────────────────────
+# FIX: Threshold-based labeling — only confident directional moves are kept.
+# return > +0.5% → 1 (UP), return < -0.5% → 0 (DOWN), otherwise → dropped.
+# Removes ambiguous "noise" rows and makes the task learnable.
+LABEL_THRESHOLD  = 0.005   # 0.5%
 RANDOM_SEED      = 42
 TRAIN_RATIO      = 0.70
 VAL_RATIO        = 0.15
+
+# Direction column in merged CSV stays -1/+1.
+# Threshold filtering is applied at training time in each train.py.
+# LABEL_MAP converts filtered rows: 1->1, -1->0
 LABEL_MAP        = {-1: 0, 1: 1}
 LABEL_MAP_INV    = {0: "DOWN", 1: "UP"}
 DIRECTION_LABELS = ["DOWN", "UP"]
 
 # ── XGBoost ───────────────────────────────────────────────────────────────────
-# FIX: removed scale_pos_weight (set dynamically in train.py based on class counts,
-#      but using it with early_stopping causes DOWN bias when AUC~0.50)
-# FIX: early_stopping_rounds removed here — passed in XGBClassifier() constructor
+# FIX: Increased capacity (n_estimators 300→500, max_depth 3→6, lr 0.05→0.03)
+# FIX: colsample_bytree 0.6→0.8 — was starving trees of features
+# FIX: min_child_weight 10→5 — was too conservative
+# FIX: Relaxed regularization slightly
 XGBOOST_PARAMS = {
-    "n_estimators"    : 300,
-    "max_depth"       : 3,
-    "learning_rate"   : 0.05,
+    "n_estimators"    : 500,
+    "max_depth"       : 6,
+    "learning_rate"   : 0.03,
     "subsample"       : 0.8,
-    "colsample_bytree": 0.6,
-    "min_child_weight": 10,
-    "reg_alpha"       : 0.2,
-    "reg_lambda"      : 1.5,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 5,
+    "reg_alpha"       : 0.1,
+    "reg_lambda"      : 1.0,
     "eval_metric"     : "logloss",
     "random_state"    : 42,
     "n_jobs"          : -1,
     "tree_method"     : "hist",
 }
 
-# FIX: Revenue and Profit removed (raw rupee values, scale too large for trees
-#      without log-transform; replaced by Revenue_Growth and Profit_Growth).
-# FIX: OBV removed (raw OBV scale dominates; OBV_change is the normalised version).
-# All features verified present in merged_final.csv.
+# Revenue and Profit removed (raw rupee values, not normalised).
 XGBOOST_FEATURES = [
     # OHLCV
     "Open", "High", "Low", "Close", "Volume",
@@ -107,21 +113,21 @@ XGBOOST_FEATURES = [
     "Close_roll_mean_10","Close_roll_std_10",
     "Close_roll_mean_20","Close_roll_std_20",
     # Derived technical
-    "BB_pct","Volume_ratio","volume_shock","Momentum_5d","Momentum_10d",
+    "BB_pct","Volume_ratio","volume_shock","volume_change","Momentum_5d","Momentum_10d",
     "EMA_dist","EMA_dist_50","RSI_overbought","RSI_oversold",
-    "RSI_change","OBV_change","price_accel","EMA_cross_9_20",
+    "RSI_change","OBV_change","price_accel","EMA_cross_9_20","return_3d","volatility_5d","price_above_ema200",
     # Cross-sectional
     "CS_momentum_rank","CS_volume_rank","CS_rsi_rank","CS_atr_rank",
     # Regime & context
     "pct_from_52w_high","pct_from_52w_low","sector_encoded",
     "market_vol_20d","intraday_range","gap_pct",
-    # Fundamental (growth rates only — raw Revenue/Profit removed)
+    # Fundamental (growth rates only)
     "PE_Ratio","EPS","ROE","Debt_to_Equity",
     "Revenue_Growth","Profit_Growth",
     # Events
     "event_score_max","event_count","is_event",
-    # News (news_score_5d and has_news kept but will be 0 if no news.csv)
-    "news_score","news_score_5d","news_positive","news_negative","news_count","has_news",
+    # News
+    "news_score","news_score_5d","news_score_7d","news_positive","news_negative","news_count","has_news",
 ]
 
 # ── LSTM ──────────────────────────────────────────────────────────────────────
@@ -138,7 +144,7 @@ LSTM_DROPOUT  = 0.3
 LSTM_EPOCHS   = 60
 LSTM_BATCH    = 128
 LSTM_LR       = 0.001
-LSTM_PATIENCE = 15   # FIX: increased from 12 to 15 (model was stopping too early)
+LSTM_PATIENCE = 15
 
 # ── FinBERT ───────────────────────────────────────────────────────────────────
 FINBERT_MODEL      = "ProsusAI/finbert"

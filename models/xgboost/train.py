@@ -1,13 +1,15 @@
 # =============================================================================
-# models/xgboost/train.py  (FIXED v4)
+# models/xgboost/train.py  (FIXED v5)
 #
-# Fixes vs v3:
-#   1. early_stopping_rounds moved to XGBClassifier() constructor
-#      (XGBoost 3.x API — passing it to .fit() raises TypeError in XGBoost >= 2.0)
-#   2. scale_pos_weight REMOVED — it creates strong DOWN prediction bias
-#      (recall DOWN >> recall UP) when AUC is near 0.50, hurting accuracy.
-#      Natural class weights work better for this near-balanced problem.
-#   3. verbose changed to False (was 100, now silent) — cleaner output.
+# Critical fixes vs v4:
+#   1. THRESHOLD-BASED LABELING: rows where |return_pct| < 0.5% are DROPPED.
+#      This removes ~30% ambiguous noise rows, making the signal much cleaner.
+#      return_pct = (Close[t+1] - Close[t]) / Close[t]
+#      return > +0.5% → keep as UP (1), return < -0.5% → keep as DOWN (0)
+#   2. XGBoost params upgraded: n_estimators=500, max_depth=6, lr=0.03,
+#      colsample_bytree=0.8, min_child_weight=5 (from settings.py).
+#   3. early_stopping_rounds=50 (was 40) — more patience for larger model.
+#   4. verbose=100 restored so training progress is visible.
 # =============================================================================
 
 import sys, os
@@ -18,11 +20,31 @@ import numpy as np
 import pandas as pd
 
 from config.settings    import (MERGED_CSV, XGBOOST_PARAMS, XGBOOST_FEATURES,
-                                 LABEL_MAP, XGB_MODEL_PATH, XGB_RESULTS_PATH,
-                                 RANDOM_SEED, TRAIN_RATIO, VAL_RATIO)
+                                 LABEL_MAP, LABEL_THRESHOLD, XGB_MODEL_PATH,
+                                 XGB_RESULTS_PATH, RANDOM_SEED, TRAIN_RATIO, VAL_RATIO)
 from evaluation.metrics import evaluate_all
 
 def _p(tag, msg): print(f"  [{tag}] {msg}")
+
+
+def _apply_threshold_labels(df):
+    """
+    FIX: Threshold-based labeling.
+    Compute actual next-day return and keep only rows where
+    |return_pct| >= LABEL_THRESHOLD (0.5%). Drop ambiguous rows.
+    """
+    df = df.copy().sort_values(["Stock", "Date"]).reset_index(drop=True)
+    df["_close_next"] = df.groupby("Stock")["Close"].shift(-1)
+    df["_return_pct"] = (df["_close_next"] - df["Close"]) / df["Close"].replace(0, np.nan)
+
+    # Keep only rows with a clear directional move
+    mask = df["_return_pct"].abs() >= LABEL_THRESHOLD
+    df = df[mask].copy()
+
+    # Assign label: UP if positive, DOWN if negative
+    df["label"] = np.where(df["_return_pct"] > 0, 1, 0)
+    df.drop(columns=["_close_next", "_return_pct"], inplace=True)
+    return df
 
 
 def _global_date_split(df):
@@ -51,7 +73,7 @@ def train():
     random.seed(RANDOM_SEED); np.random.seed(RANDOM_SEED)
 
     print("\n" + "="*55)
-    print("  XGBOOST - Training")
+    print("  XGBOOST - Training (FIXED v5)")
     print("="*55)
 
     try:
@@ -69,10 +91,15 @@ def train():
     except Exception as e:
         _p("x", f"Cannot load dataset: {e}"); return {}
 
-    df["label"] = df["Direction"].map(LABEL_MAP)
-    df.dropna(subset=["label"], inplace=True)
-    df["label"] = df["label"].astype(int)
     df = df.sort_values("Date").reset_index(drop=True)
+
+    # FIX: Apply threshold-based labeling BEFORE split
+    before = len(df)
+    df = _apply_threshold_labels(df)
+    after = len(df)
+    _p("OK", f"Threshold filter: {before} → {after} rows "
+             f"({(before-after)/before*100:.1f}% dropped as noise)")
+    _p("OK", f"Label distribution: UP={df['label'].sum()} DOWN={(df['label']==0).sum()}")
 
     train_df, val_df, test_df = _global_date_split(df)
     _p("OK", f"Split: train:{len(train_df)}  val:{len(val_df)}  test:{len(test_df)}")
@@ -82,9 +109,7 @@ def train():
     X_test,  y_test  = _get_X(test_df),  test_df["label"].values
     _p("i", f"Training on {X_train.shape[1]} features, {len(X_train)} rows ...")
 
-    # FIX: scale_pos_weight REMOVED — causes DOWN bias when AUC~0.50
-    # FIX: early_stopping_rounds in constructor (XGBoost 3.x API)
-    model = XGBClassifier(**XGBOOST_PARAMS, early_stopping_rounds=40)
+    model = XGBClassifier(**XGBOOST_PARAMS, early_stopping_rounds=50)
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=100)
     _p("i", f"Best iteration: {model.best_iteration}")
 

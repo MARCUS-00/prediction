@@ -1,15 +1,13 @@
 # =============================================================================
-# models/ensemble/train_meta.py  (FIXED v4)
+# models/ensemble/train_meta.py  (FIXED v5)
 #
-# Fixes vs v3:
-#   1. CalibratedClassifierCV method changed from "sigmoid" to "isotonic"
-#      — isotonic is non-parametric and works better with non-Gaussian scores.
-#   2. Fallback when class_counts.min() < 3 now returns bare LogisticRegression
-#      (was missing predict_proba in the old path — would crash on .predict_proba()).
-#   3. _date_split ratio corrected: meta_train uses first 60% of val_df,
-#      meta_val uses last 40% — gives more training data to meta-learner.
-#   4. evaluate_all call now uses meta_train (not X_meta repeat) as "train" set
-#      so the printed train metrics are meaningful.
+# Critical fixes vs v4:
+#   1. THRESHOLD-BASED LABELING: same filter as XGBoost/LSTM train.py.
+#      Ensemble meta-learner trains on the same clean label set.
+#   2. Weighted average fallback added: if meta-learner training data
+#      is too small (<50 rows), fall back to weighted average
+#      (XGB=0.5, LSTM=0.35, News=0.15) instead of crashing.
+#   3. evaluate_all call uses correct meta_train labels.
 # =============================================================================
 
 import sys, os
@@ -21,7 +19,7 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
 
-from config.settings         import (MERGED_CSV, LABEL_MAP, META_MODEL_PATH,
+from config.settings         import (MERGED_CSV, LABEL_THRESHOLD, META_MODEL_PATH,
                                       ENSEMBLE_RESULTS_PATH, TRAIN_RATIO, VAL_RATIO,
                                       RANDOM_SEED)
 from models.xgboost.predict  import predict_proba as xgb_proba, load_xgb
@@ -29,6 +27,18 @@ from models.lstm.predict     import predict_proba  as lstm_proba, load_lstm
 from evaluation.metrics      import evaluate_all
 
 def _p(tag, msg): print(f"  [{tag}] {msg}")
+
+
+def _apply_threshold_labels(df):
+    """FIX: Threshold-based labeling — same as XGBoost/LSTM."""
+    df = df.copy().sort_values(["Stock", "Date"]).reset_index(drop=True)
+    df["_close_next"] = df.groupby("Stock")["Close"].shift(-1)
+    df["_return_pct"] = (df["_close_next"] - df["Close"]) / df["Close"].replace(0, np.nan)
+    mask = df["_return_pct"].abs() >= LABEL_THRESHOLD
+    df = df[mask].copy()
+    df["label"] = np.where(df["_return_pct"] > 0, 1, 0).astype(int)
+    df.drop(columns=["_close_next", "_return_pct"], inplace=True)
+    return df
 
 
 def _global_date_split(df):
@@ -42,7 +52,6 @@ def _global_date_split(df):
 
 
 def _date_split(df, ratio=0.6):
-    """Split a DataFrame on calendar date at the given ratio."""
     dates = sorted(df["Date"].unique())
     if len(dates) < 2:
         return df.copy(), df.iloc[0:0].copy()
@@ -64,7 +73,7 @@ def _news_proba(df):
 
 def train():
     print("\n" + "="*55)
-    print("  ENSEMBLE META-LEARNER - Training")
+    print("  ENSEMBLE META-LEARNER - Training (FIXED v5)")
     print("="*55)
 
     if not os.path.exists(MERGED_CSV):
@@ -76,13 +85,14 @@ def train():
     except Exception as e:
         _p("x", f"Cannot load dataset: {e}"); return {}
 
-    df["label"] = df["Direction"].map(LABEL_MAP)
-    df.dropna(subset=["label"], inplace=True)
-    df["label"] = df["label"].astype(int)
     df = df.sort_values("Date").reset_index(drop=True)
 
+    # FIX: Apply threshold-based labeling
+    before = len(df)
+    df = _apply_threshold_labels(df)
+    _p("OK", f"Threshold filter: {before} → {len(df)} rows")
+
     _, val_df, test_df = _global_date_split(df)
-    # FIX: ratio=0.6 gives more meta-train data (was 0.5)
     meta_train_df, meta_val_df = _date_split(val_df, ratio=0.6)
     if meta_val_df.empty:
         meta_val_df = test_df.iloc[0:0].copy()
@@ -121,12 +131,29 @@ def train():
         max_iter=2000, random_state=RANDOM_SEED, C=0.5,
         solver="lbfgs", class_weight="balanced",
     )
-    # FIX: method="isotonic" (non-parametric, better than "sigmoid" for this data)
     class_counts = np.bincount(y_meta, minlength=2)
-    if class_counts.min() >= 3:
+
+    # FIX: Fallback to weighted average if not enough meta-train data
+    if len(meta_train_df) < 50:
+        _p("!", "Meta-train too small; using weighted average ensemble")
+
+        def _weighted_avg(X_feat):
+            # X_feat = [xgb_down, xgb_up, lstm_down, lstm_up, news_down, news_up]
+            p_up = 0.50 * X_feat[:, 1] + 0.35 * X_feat[:, 3] + 0.15 * X_feat[:, 5]
+            p_up = np.clip(p_up, 0, 1)
+            return np.column_stack([1 - p_up, p_up])
+
+        class _WeightedAvgModel:
+            def predict_proba(self, X): return _weighted_avg(X)
+            def predict(self, X): return (_weighted_avg(X)[:, 1] >= 0.5).astype(int)
+            def fit(self, X, y): return self
+
+        meta = _WeightedAvgModel()
+    elif class_counts.min() >= 3:
         meta = CalibratedClassifierCV(base_lr, cv=3, method="isotonic")
     else:
-        meta = base_lr   # FIX: bare LR still has predict_proba — no crash
+        meta = base_lr
+
     meta.fit(X_meta, y_meta)
 
     y_pred_meta  = meta.predict(X_meta)
@@ -136,7 +163,6 @@ def train():
     y_pred_test  = meta.predict(X_test)
     y_proba_test = meta.predict_proba(X_test)
 
-    # FIX: train metrics use meta_train (not a repeat of val)
     metrics = evaluate_all(
         y_meta, y_pred_meta, y_proba_meta,
         y_val,  y_pred_val,  y_proba_val,

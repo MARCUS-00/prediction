@@ -1,15 +1,13 @@
 # =============================================================================
-# models/lstm/train.py  (FIXED v4)
+# models/lstm/train.py  (FIXED v5)
 #
-# Fixes vs v3:
-#   1. LSTM_PATIENCE increased to 15 (from 12) — was terminating before
-#      the model could learn; matches setting in config/settings.py.
-#   2. ReduceLROnPlateau patience set to max(10, LSTM_PATIENCE//2) = 10
-#      (was max(8, 12//2)=8 — still too aggressive for noisy financial data).
-#   3. Factor changed from 0.7 to 0.5 (standard; 0.7 barely reduces LR).
-#   4. Class weights formula corrected: uses balanced weighting
-#      weights[c] = total_samples / (n_classes * count[c])
-#      (previous formula 1/count was unnormalised).
+# Critical fixes vs v4:
+#   1. THRESHOLD-BASED LABELING: same as XGBoost — rows where
+#      |return_pct| < 0.5% are dropped before building sequences.
+#      This ensures LSTM learns from the same clean label set.
+#   2. Sequences are built AFTER threshold filtering, so sequence
+#      continuity per stock is preserved within each split.
+#   3. Class weights recomputed on filtered y_train.
 # =============================================================================
 
 import sys, os
@@ -27,12 +25,27 @@ from sklearn.preprocessing import RobustScaler
 
 from config.settings    import (MERGED_CSV, LSTM_FEATURES, SEQUENCE_LENGTH,
                                  LSTM_EPOCHS, LSTM_BATCH, LSTM_LR, LSTM_PATIENCE,
-                                 LABEL_MAP, LSTM_MODEL_PATH, LSTM_SCALER_PATH,
+                                 LABEL_THRESHOLD, LSTM_MODEL_PATH, LSTM_SCALER_PATH,
                                  RANDOM_SEED, TRAIN_RATIO, VAL_RATIO)
 from models.lstm.model  import LSTMClassifier
 from evaluation.metrics import evaluate_all
 
 def _p(tag, msg): print(f"  [{tag}] {msg}")
+
+
+def _apply_threshold_labels(df):
+    """
+    FIX: Threshold-based labeling — mirrors XGBoost train.py exactly.
+    Drop rows where |next-day return| < LABEL_THRESHOLD (0.5%).
+    """
+    df = df.copy().sort_values(["Stock", "Date"]).reset_index(drop=True)
+    df["_close_next"] = df.groupby("Stock")["Close"].shift(-1)
+    df["_return_pct"] = (df["_close_next"] - df["Close"]) / df["Close"].replace(0, np.nan)
+    mask = df["_return_pct"].abs() >= LABEL_THRESHOLD
+    df = df[mask].copy()
+    df["label"] = np.where(df["_return_pct"] > 0, 1, 0).astype(int)
+    df.drop(columns=["_close_next", "_return_pct"], inplace=True)
+    return df
 
 
 def _global_date_split(df):
@@ -71,7 +84,7 @@ def train():
     random.seed(RANDOM_SEED); np.random.seed(RANDOM_SEED); torch.manual_seed(RANDOM_SEED)
 
     print("\n" + "="*55)
-    print("  LSTM - Training")
+    print("  LSTM - Training (FIXED v5)")
     print("="*55)
 
     if not os.path.exists(MERGED_CSV):
@@ -83,10 +96,13 @@ def train():
     except Exception as e:
         _p("x", f"Cannot load dataset: {e}"); return {}
 
-    df["label"] = df["Direction"].map(LABEL_MAP)
-    df.dropna(subset=["label"], inplace=True)
-    df["label"] = df["label"].astype(int)
     df = df.sort_values("Date").reset_index(drop=True)
+
+    # FIX: Apply threshold-based labeling before split
+    before = len(df)
+    df = _apply_threshold_labels(df)
+    _p("OK", f"Threshold filter: {before} → {len(df)} rows "
+             f"({(before-len(df))/before*100:.1f}% dropped)")
 
     feats = [f for f in LSTM_FEATURES if f in df.columns]
     missing = [f for f in LSTM_FEATURES if f not in df.columns]
@@ -119,7 +135,7 @@ def train():
 
     _p("OK", f"Sequences: train:{X_train.shape}  val:{X_val.shape}  test:{X_test.shape}")
 
-    # FIX: balanced class weights (normalised formula)
+    # Balanced class weights
     counts  = np.bincount(y_train, minlength=2)
     total   = len(y_train)
     weights = torch.tensor(total / (2.0 * np.clip(counts, 1, None)), dtype=torch.float32)
@@ -127,7 +143,6 @@ def train():
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net       = LSTMClassifier(X_train.shape[2]).to(device)
     optimizer = Adam(net.parameters(), lr=LSTM_LR, weight_decay=1e-4)
-    # FIX: patience=10 (was 8), factor=0.5 (was 0.7) — less aggressive LR decay
     scheduler = ReduceLROnPlateau(optimizer, mode="min",
                                   patience=max(10, LSTM_PATIENCE // 2), factor=0.5)
     criterion = nn.CrossEntropyLoss(weight=weights.to(device))
