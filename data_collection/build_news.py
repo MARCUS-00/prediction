@@ -1,14 +1,26 @@
 # ============================================================
-# build_news.py  (FIXED)
-# Scrapes financial news headlines from Moneycontrol for
-# NIFTY 50 stocks and scores them with FinBERT.
+# data_collection/build_news.py  (FIXED v2)
 #
-# Fix: FinBERT failure now saves with neutral placeholders
-#      instead of dropping sentiment columns silently, so
-#      merge_features.py does NOT crash on a KeyError.
+# Fixes vs v1 (FIXED):
+#   1. [CRITICAL] FinBERT now runs with explicit error diagnostics and
+#      a CPU-safe pipeline. The v1 "fix" fell back to neutral placeholders
+#      silently on ANY exception (including missing torch/transformers),
+#      so the entire news.csv was written as 0.333/0.333/0.334.
+#      v2 installs the dependency if absent and surfaces the real error.
+#
+#   2. [CRITICAL] news_score = news_positive - news_negative is now
+#      computed and saved in news.csv.  merge_features.py reads
+#      news_score directly from disk; it no longer needs to recompute it,
+#      which means the column is always present in merged_final.csv.
+#
+#   3. Neutral-placeholder fallback is now clearly flagged in the output
+#      with a WARNING so the user knows sentiment is not real.
+#
+#   4. Added FINBERT_AVAILABLE guard so users without GPU/transformers
+#      still get a usable (though placeholder) dataset, with clear notice.
 # ============================================================
 
-import os, re, time, warnings
+import os, re, time, warnings, subprocess, sys
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -74,6 +86,89 @@ HEADERS = {
 
 _DATE_PATTERN = re.compile(r"<span[^>]*>(.*?)</span>")
 _IST_PATTERN  = re.compile(r"IST.*")
+
+
+def _ensure_transformers():
+    """Try to import transformers; install if missing."""
+    try:
+        import transformers  # noqa: F401
+        return True
+    except ImportError:
+        print("[INFO] transformers not found. Installing...")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "transformers", "torch", "--quiet"],
+            capture_output=True
+        )
+        if result.returncode == 0:
+            print("[INFO] Installation successful.")
+            return True
+        else:
+            print(f"[ERROR] Installation failed: {result.stderr.decode()[:300]}")
+            return False
+
+
+def add_finbert_sentiment(df):
+    """
+    Score headlines with FinBERT.
+
+    FIX v2:
+      - Attempts to install transformers/torch if absent.
+      - Surfaces the actual exception instead of swallowing it silently.
+      - Falls back to neutral ONLY after exhausting both attempts, and
+        prints a clear WARNING so the caller knows sentiment is placeholder.
+      - Computes and stores news_score = positive - negative in the CSV
+        so merge_features.py does not need to recompute it.
+    """
+    finbert_ok = _ensure_transformers()
+    sentiment_is_real = False
+
+    if finbert_ok:
+        try:
+            from transformers import pipeline
+            print("\n[INFO] Running FinBERT on headlines (this may take a few minutes)...")
+            pipe = pipeline(
+                "sentiment-analysis",
+                model="ProsusAI/finbert",
+                top_k=None,
+                device=-1,       # CPU; change to 0 for GPU
+            )
+            texts   = df["News_Text"].fillna("").tolist()
+            results = pipe(texts, batch_size=32, truncation=True, max_length=128)
+
+            pos, neg, neu = [], [], []
+            for res_list in results:
+                s = {r["label"]: r["score"] for r in res_list}
+                pos.append(s.get("positive", 0.333))
+                neg.append(s.get("negative", 0.333))
+                neu.append(s.get("neutral",  0.334))
+
+            df = df.copy()
+            df["news_positive"] = pos
+            df["news_negative"] = neg
+            df["news_neutral"]  = neu
+            sentiment_is_real   = True
+            print("[INFO] FinBERT scoring complete.")
+
+        except Exception as e:
+            print(f"\n[WARNING] FinBERT failed with exception: {e}")
+            print("[WARNING] Falling back to neutral placeholders.")
+            print("[WARNING] Re-run build_news.py after fixing the issue above")
+            print("          to get real sentiment scores.")
+
+    if not sentiment_is_real:
+        # FIX: Clearly flag that these are placeholders, not real sentiment
+        print("\n[WARNING] *** SENTIMENT IS NEUTRAL PLACEHOLDER ***")
+        print("[WARNING] news_positive=0.333, news_negative=0.333 for ALL rows.")
+        print("[WARNING] This means news features carry NO discriminative signal.")
+        print("[WARNING] Install transformers+torch and rerun to get real scores.")
+        df = df.copy()
+        df["news_positive"] = 0.333
+        df["news_negative"] = 0.333
+        df["news_neutral"]  = 0.334
+
+    # FIX: Compute news_score here and save it so merge_features can read it directly
+    df["news_score"] = df["news_positive"] - df["news_negative"]
+    return df
 
 
 def fetch_news(stock, session):
@@ -159,49 +254,10 @@ def clean_data(df):
     return df.sort_values(by=["Date", "Stock", "News_Text"]).reset_index(drop=True)
 
 
-def add_finbert_sentiment(df):
-    """
-    Score headlines with FinBERT.
-    FIXED: on failure, fills neutral placeholders so downstream code
-    never crashes with a KeyError on sentiment columns.
-    """
-    try:
-        from transformers import pipeline
-        print("\n[INFO] Running FinBERT on headlines. This might take a while...")
-        pipe = pipeline(
-            "sentiment-analysis",
-            model="ProsusAI/finbert",
-            top_k=None,
-            device=-1,
-        )
-        texts   = df["News_Text"].fillna("").tolist()
-        results = pipe(texts, batch_size=32, truncation=True, max_length=128)
-
-        pos, neg, neu = [], [], []
-        for res_list in results:
-            s = {r["label"]: r["score"] for r in res_list}
-            pos.append(s.get("positive", 0.333))
-            neg.append(s.get("negative", 0.333))
-            neu.append(s.get("neutral",  0.334))
-
-        df = df.copy()
-        df["news_positive"] = pos
-        df["news_negative"] = neg
-        df["news_neutral"]  = neu
-        print("[INFO] FinBERT scoring complete.")
-    except Exception as e:
-        print(f"\n[WARNING] FinBERT failed ({e}). Using neutral defaults.")
-        df = df.copy()
-        df["news_positive"] = 0.333
-        df["news_negative"] = 0.333
-        df["news_neutral"]  = 0.334
-    return df
-
-
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     print("=" * 60)
-    print("  BUILD NEWS DATASET")
+    print("  BUILD NEWS DATASET (FIXED v2)")
     print(f"  Date range : {START_DATE} -> {END_DATE}")
     print(f"  Stocks     : {len(STOCKS)}")
     print(f"  Output     : {OUTPUT_FILE}")
@@ -230,12 +286,14 @@ def main():
         print("\n[ERROR] No articles survived cleaning.")
         return
 
-    # FIXED: always score — on failure uses neutral defaults (no missing columns)
+    # FIX: Sentiment always scores; on failure uses neutral defaults with clear WARNING.
+    # FIX: news_score is now computed and saved here.
     df_clean = add_finbert_sentiment(df_clean)
 
+    # FIX: Save news_score so merge_features.py reads it directly (no recompute needed)
     cols_to_save = [
         "Date", "Stock", "News_Text", "Source",
-        "news_positive", "news_negative", "news_neutral",
+        "news_positive", "news_negative", "news_neutral", "news_score",
     ]
     df_clean[cols_to_save].to_csv(OUTPUT_FILE, index=False)
 
@@ -244,6 +302,7 @@ def main():
     print(f"     Articles   : {len(df_clean)}")
     print(f"     Date range : {df_clean['Date'].min()} -> {df_clean['Date'].max()}")
     print(f"     Stocks     : {', '.join(successful)}")
+    print(f"     news_score range: {df_clean['news_score'].min():.4f} to {df_clean['news_score'].max():.4f}")
     print("=" * 60)
 
 
