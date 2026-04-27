@@ -1,1 +1,1 @@
-data/merged/*.csv
+data/**/*.csv
