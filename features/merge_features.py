@@ -46,6 +46,12 @@ from config.settings import (
     SECTOR_MAP,
 )
 
+# Optional news CSV path — set NEWS_CSV in settings or leave as None to skip
+try:
+    from config.settings import NEWS_CSV
+except ImportError:
+    NEWS_CSV = None
+
 
 def _p(tag, msg):
     print(f"  [{tag}] {msg}")
@@ -94,7 +100,36 @@ def _load_fundamental():
     return df[["Stock", "Year", "Sector"] + num_cols]
 
 
-def _load_nifty_features(date_index):
+def _load_news_features():
+    """
+    Load news sentiment scores and compute 5-day rolling mean.
+    Expects a CSV with columns: Date, Stock, news_score.
+    Returns a DataFrame with Date, Stock, news_score, news_score_5d
+    or an empty DataFrame if not available.
+    """
+    if NEWS_CSV is None or not os.path.exists(NEWS_CSV):
+        _p("!", "news.csv not found — news_score features will be absent")
+        return pd.DataFrame()
+    try:
+        ndf = pd.read_csv(NEWS_CSV)
+        ndf["Date"]  = pd.to_datetime(ndf["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        ndf["Stock"] = ndf["Stock"].astype(str).str.replace(".NS", "", regex=False)
+        ndf["news_score"] = pd.to_numeric(ndf["news_score"], errors="coerce")
+        ndf.dropna(subset=["Date", "Stock", "news_score"], inplace=True)
+        ndf.drop_duplicates(subset=["Date", "Stock"], inplace=True)
+        ndf.sort_values(["Stock", "Date"], inplace=True)
+        ndf["news_score_5d"] = (
+            ndf.groupby("Stock")["news_score"]
+               .transform(lambda x: x.rolling(5, min_periods=1).mean())
+        )
+        _p("OK", f"News features loaded: {ndf.shape}")
+        return ndf[["Date", "Stock", "news_score", "news_score_5d"]]
+    except Exception as e:
+        _p("!", f"News load failed ({e}); skipping news features")
+        return pd.DataFrame()
+
+
+
     """Fetch NIFTY50 features; falls back to zeros gracefully."""
     dates = pd.DatetimeIndex(pd.to_datetime(date_index))
     start = dates.min() - pd.Timedelta(days=80)
@@ -123,7 +158,8 @@ def _load_nifty_features(date_index):
         _p("OK", f"NIFTY features: {len(nifty)} days")
         return nifty[["nifty_ret_1d", "nifty_ret_5d", "nifty_rsi", "nifty_above_ema20"]]
     except Exception as e:
-        _p("!", f"NIFTY fetch failed ({e}); zero-filling")
+        _p("!", f"NIFTY fetch failed ({e}); zero-filling — "
+                 "ret_vs_nifty_* and alpha_5d signals will be weakened!")
         return pd.DataFrame(0.0, index=date_index,
                             columns=["nifty_ret_1d", "nifty_ret_5d",
                                      "nifty_rsi", "nifty_above_ema20"])
@@ -139,7 +175,13 @@ def _compute_stock_features(df):
     for stock, sdf in df.groupby("Stock", sort=False):
         sdf  = sdf.copy()
         c    = sdf["Close"]
-        r1   = sdf["Return_1d"] if "Return_1d" in sdf.columns else c.pct_change(1)
+        # Use lagged Return_1d to ensure past-only data (no pct_change() fallback
+        # which would use current-period close and risk subtle leakage).
+        if "Return_1d" in sdf.columns:
+            sdf["Return_1d_lag1"] = sdf["Return_1d"].shift(1)
+        else:
+            sdf["Return_1d_lag1"] = c.shift(1).pct_change(1)
+        r1   = sdf["Return_1d_lag1"]
         vol  = sdf["Volume"]
 
         # Momentum
@@ -346,7 +388,7 @@ def merge_all():
             if col in merged.columns:
                 merged[col] = (
                     merged.groupby("Stock")[col]
-                          .transform(lambda x: x.ffill().bfill())
+                          .transform(lambda x: x.ffill())   # ffill only — bfill leaks future data
                 )
         _p("OK", f"Fundamentals merged: {merged.shape}")
     else:
@@ -356,6 +398,10 @@ def merge_all():
     merged.drop(columns=["Year"], inplace=True, errors="ignore")
 
     # 4. NIFTY features
+    # Ensure consistent sort order before all rolling/group operations
+    merged.sort_values(["Stock", "Date"], inplace=True)
+    merged.reset_index(drop=True, inplace=True)
+
     nifty_df = _load_nifty_features(merged["Date"].unique())
     merged = merged.merge(
         nifty_df.reset_index().rename(columns={"index": "Date"}),
@@ -376,6 +422,18 @@ def merge_all():
     nifty_fwd_series = date_nifty_ts.shift(-5)   # 5 trading days forward
     nifty_fwd_map = {k.strftime("%Y-%m-%d"): v
                      for k, v in nifty_fwd_series.items()}
+
+    # 4b. News features (left join on Date + Stock — preserves all rows)
+    news_df = _load_news_features()
+    if not news_df.empty:
+        merged = merged.merge(news_df, on=["Date", "Stock"], how="left")
+        merged["news_score"]    = merged["news_score"].fillna(0.0)
+        merged["news_score_5d"] = merged["news_score_5d"].fillna(0.0)
+        _p("OK", "News features merged via left join")
+    else:
+        merged["news_score"]    = 0.0
+        merged["news_score_5d"] = 0.0
+        _p("!", "news_score columns set to 0.0 (no news data available)")
 
     # 5. Sector LOO features
     merged = _add_sector_features(merged)
@@ -398,6 +456,12 @@ def merge_all():
 
     # 9. Alpha label (forward-looking)
     merged = _add_alpha_label(merged, nifty_fwd_map)
+
+    # Apply noise filter: remove rows where |alpha_5d| <= 1% (low-signal samples)
+    before_noise = len(merged)
+    merged = merged[merged["alpha_5d"].isna() | (merged["alpha_5d"].abs() > 0.01)]
+    _p("OK", f"Noise filter abs(alpha_5d)>0.01: {before_noise} → {len(merged)} "
+              f"(removed {before_noise - len(merged)})")
 
     # 10. Data cleaning
     before = len(merged)
@@ -422,6 +486,12 @@ def merge_all():
         _p("!", f"Dropping constant columns: {const_cols}")
         merged.drop(columns=const_cols, inplace=True)
 
+    # Drop any duplicate (Date, Stock) rows that may have crept in during merges
+    before_dedup = len(merged)
+    merged.drop_duplicates(subset=["Date", "Stock"], keep="last", inplace=True)
+    if len(merged) < before_dedup:
+        _p("!", f"Removed {before_dedup - len(merged)} duplicate (Date, Stock) rows")
+
     # 11. Save
     merged.sort_values(["Stock", "Date"], inplace=True)
     merged.reset_index(drop=True, inplace=True)
@@ -437,14 +507,78 @@ def merge_all():
     print(f"\n  Alpha label  →  total={alpha_valid}  UP(>+1%)={pos}  DOWN(<-1%)={neg}")
     print(f"  Balance: UP%={pos/(pos+neg)*100:.1f}%" if (pos+neg) > 0 else "")
 
-    print("\n  Feature check:")
-    key_feats = ["ret_vs_nifty_1d", "ret_vs_nifty_5d", "ret_vs_sector_1d",
-                 "ret_vs_sector_5d", "alpha_strength", "vol_spike",
-                 "vol_breakout", "momentum_diff", "price_pos_20d",
-                 "atr_ratio", "alpha_5d"]
+    # ── Sanity check ──────────────────────────────────────────────────────────
+    print("\n" + "─" * 62)
+    print("  SANITY CHECK")
+    print("─" * 62)
+
+    # Shape
+    print(f"  Dataset shape  : {merged.shape}")
+    print(f"  Date range     : {merged['Date'].min()}  →  {merged['Date'].max()}")
+    print(f"  Unique stocks  : {merged['Stock'].nunique()}")
+
+    # Missing value % for all numeric columns (flag if >20%)
+    num_cols_final = merged.select_dtypes(include=[np.number]).columns.tolist()
+    miss_pct = (merged[num_cols_final].isna().mean() * 100).sort_values(ascending=False)
+    high_miss = miss_pct[miss_pct > 20]
+    if not high_miss.empty:
+        print(f"\n  ⚠ Columns with >20% missing values:")
+        for col, pct in high_miss.items():
+            print(f"      {col:35s} {pct:.1f}%")
+    else:
+        print("  ✓ No columns with >20% missing values")
+
+    # Critical feature presence & sparsity check
+    critical_feats = [
+        "ret_vs_nifty_1d", "ret_vs_nifty_5d", "alpha_5d",
+        "momentum_5d", "vol_spike", "news_score",
+        "news_score_5d", "nifty_ret_1d", "nifty_ret_5d",
+    ]
+    print("\n  Critical feature check:")
+    all_critical_ok = True
+    for f in critical_feats:
+        if f not in merged.columns:
+            print(f"    ✗ MISSING  {f}")
+            all_critical_ok = False
+        else:
+            pct_null = merged[f].isna().mean() * 100
+            pct_zero = (merged[f] == 0).mean() * 100
+            warn = ""
+            if pct_null > 50:
+                warn = "  ⚠ mostly NaN!"
+                all_critical_ok = False
+            elif pct_zero > 90:
+                warn = "  ⚠ mostly zero (signal likely absent)"
+                all_critical_ok = False
+            print(f"    ✓  {f:35s}  null={pct_null:.1f}%  zero={pct_zero:.1f}%{warn}")
+    if all_critical_ok:
+        print("  ✓ All critical features present and populated")
+
+    # Target balance
+    if (pos + neg) > 0:
+        balance_pct = pos / (pos + neg) * 100
+        if balance_pct < 35 or balance_pct > 65:
+            print(f"\n  ⚠ Target imbalance: UP={balance_pct:.1f}%  DOWN={100-balance_pct:.1f}%")
+        else:
+            print(f"\n  ✓ Target balance OK: UP={balance_pct:.1f}%  DOWN={100-balance_pct:.1f}%")
+
+    # NIFTY zero-fill warning
+    nifty_zero_frac = (merged["nifty_ret_1d"] == 0).mean()
+    if nifty_zero_frac > 0.5:
+        print(f"\n  ⚠ nifty_ret_1d is zero for {nifty_zero_frac*100:.1f}% of rows — "
+              "NIFTY data likely absent; relative-strength features will be unreliable.")
+
+    print("\n  All key feature columns:")
+    key_feats = [
+        "ret_vs_nifty_1d", "ret_vs_nifty_5d", "ret_vs_sector_1d",
+        "ret_vs_sector_5d", "alpha_strength", "vol_spike",
+        "vol_breakout", "momentum_diff", "price_pos_20d",
+        "atr_ratio", "alpha_5d", "news_score", "news_score_5d",
+    ]
     for f in key_feats:
         status = "✓" if f in merged.columns else "✗ MISSING"
-        print(f"    {f:30s} {status}")
+        print(f"    {f:35s} {status}")
+
     print("\n  Sector distribution:")
     print(merged["Sector"].value_counts().to_string())
 
