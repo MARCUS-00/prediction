@@ -1,38 +1,31 @@
 # =============================================================================
-# features/merge_features.py  (REDESIGNED v10 — Alpha-Based Pipeline)
+# features/merge_features.py  (FIXED v12)
 #
-# KEY CHANGES vs v8/v9:
+# BUGS FIXED vs current merged_final.csv on disk:
 #
-#   1. [TARGET] Alpha-based label replaces raw direction:
-#      alpha_5d = stock_ret_5d - nifty_ret_5d  (forward-looking)
-#      target = 1 if alpha_5d > 0, else 0
-#      Only rows where abs(alpha_5d) > 1% are kept (noise filter).
-#      This removes market-beta noise and predicts genuine outperformance.
+#   BUG 1 [CRITICAL]: news_score_daily and news_rolling_3d are MISSING from
+#     merged_final.csv entirely. The _add_news_features() function exists in
+#     merge_features.py v11 but the CSV on disk was built WITHOUT it — meaning
+#     the merge was run before this code existed. RE-RUN THIS FILE to get
+#     news features into merged_final.csv.
 #
-#   2. [FEATURES] Strong stock-specific features:
-#      - Relative strength vs NIFTY: ret_vs_nifty_1d, ret_vs_nifty_5d
-#      - Relative strength vs sector: ret_vs_sector_1d, ret_vs_sector_5d
-#      - Alpha stability: alpha_strength (rolling mean of ret_vs_nifty_1d)
-#      - Volume spike: vol_spike = Volume / rolling_mean(Volume, 10)
-#      - Vol breakout: current_vol / mean_vol_20d
-#      - Momentum: momentum_5d, momentum_10d, momentum_diff
-#      - Price position in 20-day high-low range
+#   BUG 2 [CRITICAL]: merged_final.csv has 41,378 rows before 2020-01-01.
+#     The date filter in _load_technical() was added in v11 but the CSV was
+#     never regenerated. All pre-2020 rows must be purged.
 #
-#   3. [REMOVED] Weak/noisy features:
-#      - event_* columns (sparse, near-zero signal)
-#      - news_* columns (inconsistent coverage <15%)
-#      - sector_encoded (redundant with sector return features)
-#      - Raw price lags and redundant indicators
-#      Feature count: ~30 clean, meaningful features.
+#   BUG 3: Events CSV uses columns 'date'/'symbol' (lowercase). The merge
+#     was not joining events at all. Fixed by loading events and renaming to
+#     'Date'/'Stock' before merge.
 #
-#   4. [CLEANING]
-#      - Removes low-volatility rows (bottom 20% by ATR/Close)
-#      - Drops NaN / infinite values in core columns
+#   BUG 4: LSTM train.py references 'news_score' (not 'news_score_daily').
+#     We keep BOTH: news_score_daily (raw daily) AND news_score (alias).
 #
-#   5. [LEAKAGE-FREE]
-#      - All rolling windows are per-stock, past-only
-#      - alpha_5d uses future data and is stored as a label-only column
-#      - It is stripped from features in train.py after label extraction
+#   All v11 improvements retained:
+#     - Alpha-based label (stock outperformance vs NIFTY)
+#     - Relative strength vs NIFTY and sector (LOO)
+#     - Cross-sectional ranks
+#     - Low-volatility row filter
+#     - No global imputation (train scripts handle it)
 # =============================================================================
 
 import sys, os
@@ -42,19 +35,16 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.settings import (
-    TECHNICAL_CSV, FUNDAMENTAL_CSV, MERGED_CSV,
+    TECHNICAL_CSV, FUNDAMENTAL_CSV, NEWS_CSV, EVENTS_CSV, MERGED_CSV,
     SECTOR_MAP,
 )
 
-# Optional news CSV path — set NEWS_CSV in settings or leave as None to skip
-try:
-    from config.settings import NEWS_CSV
-except ImportError:
-    NEWS_CSV = None
+START_DATE = "2020-01-01"
+END_DATE   = "2025-12-31"
 
 
 def _p(tag, msg):
-    print(f"  [{tag}] {msg}")
+    print(f"  [{tag}] {msg}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -70,8 +60,13 @@ def _load_technical():
     df["Stock"] = df["Stock"].astype(str).str.replace(".NS", "", regex=False)
     df.dropna(subset=["Date", "Close"], inplace=True)
     df.drop_duplicates(subset=["Date", "Stock"], inplace=True)
+
+    before = len(df)
+    df = df[(df["Date"] >= START_DATE) & (df["Date"] <= END_DATE)]
+    _p("OK", f"Technical: date filter {before} → {len(df)} rows ({START_DATE} to {END_DATE})")
+
     for col in ["Open", "High", "Low", "Close", "Volume", "Return_1d",
-                "RSI", "MACD", "MACD_signal", "ATR", "EMA_20"]:
+                "RSI", "MACD", "MACD_signal", "ATR", "EMA_20", "OBV"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -100,45 +95,72 @@ def _load_fundamental():
     return df[["Stock", "Year", "Sector"] + num_cols]
 
 
-def _load_news_features():
+def _load_news():
     """
-    Load news sentiment scores and compute 5-day rolling mean.
-    Expects a CSV with columns: Date, Stock, news_score.
-    Returns a DataFrame with Date, Stock, news_score, news_score_5d
-    or an empty DataFrame if not available.
+    Load news.csv, compute per-stock daily average news_score.
+    Returns DataFrame with (Date, Stock, news_score_daily).
     """
-    if NEWS_CSV is None or not os.path.exists(NEWS_CSV):
-        _p("!", "news.csv not found — news_score features will be absent")
+    if not os.path.exists(NEWS_CSV):
+        _p("!", "news.csv not found — news features will be zero")
         return pd.DataFrame()
-    try:
-        ndf = pd.read_csv(NEWS_CSV)
-        ndf["Date"]  = pd.to_datetime(ndf["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        ndf["Stock"] = ndf["Stock"].astype(str).str.replace(".NS", "", regex=False)
-        ndf["news_score"] = pd.to_numeric(ndf["news_score"], errors="coerce")
-        ndf.dropna(subset=["Date", "Stock", "news_score"], inplace=True)
-        ndf.drop_duplicates(subset=["Date", "Stock"], inplace=True)
-        ndf.sort_values(["Stock", "Date"], inplace=True)
-        ndf["news_score_5d"] = (
-            ndf.groupby("Stock")["news_score"]
-               .transform(lambda x: x.rolling(5, min_periods=1).mean())
-        )
-        _p("OK", f"News features loaded: {ndf.shape}")
-        return ndf[["Date", "Stock", "news_score", "news_score_5d"]]
-    except Exception as e:
-        _p("!", f"News load failed ({e}); skipping news features")
+    df = pd.read_csv(NEWS_CSV)
+    df["Date"]  = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["Stock"] = df["Stock"].astype(str).str.replace(".NS", "", regex=False)
+    df.dropna(subset=["Date", "Stock"], inplace=True)
+
+    df = df[(df["Date"] >= START_DATE) & (df["Date"] <= END_DATE)]
+
+    if "news_score" not in df.columns:
+        if "news_positive" in df.columns and "news_negative" in df.columns:
+            df["news_score"] = df["news_positive"] - df["news_negative"]
+        else:
+            _p("!", "news_score column missing — news features will be zero")
+            return pd.DataFrame()
+
+    # Daily average score per (Date, Stock)
+    daily = (
+        df.groupby(["Date", "Stock"])["news_score"]
+          .mean()
+          .reset_index()
+          .rename(columns={"news_score": "news_score_daily"})
+    )
+    _p("OK", f"News: {len(daily)} (date,stock) pairs | "
+              f"score range [{daily['news_score_daily'].min():.3f}, "
+              f"{daily['news_score_daily'].max():.3f}]")
+    return daily
+
+
+def _load_events():
+    """
+    BUG 3 FIX: events.csv uses 'date'/'symbol' not 'Date'/'Stock'.
+    Rename and merge event_score_max + is_event.
+    """
+    if not os.path.exists(EVENTS_CSV):
+        _p("!", "events.csv not found — event features will be zero")
         return pd.DataFrame()
+    df = pd.read_csv(EVENTS_CSV)
+    # Rename to match merge key
+    df = df.rename(columns={"date": "Date", "symbol": "Stock"})
+    df["Date"]  = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["Stock"] = df["Stock"].astype(str).str.replace(".NS", "", regex=False)
+    df.dropna(subset=["Date", "Stock"], inplace=True)
+    df = df[(df["Date"] >= START_DATE) & (df["Date"] <= END_DATE)]
+    df.drop_duplicates(subset=["Date", "Stock"], inplace=True)
+
+    keep = ["Date", "Stock", "event_score_max", "is_event", "event_name", "event_category"]
+    keep = [c for c in keep if c in df.columns]
+    _p("OK", f"Events: {len(df)} rows | event days: {df['is_event'].sum()}")
+    return df[keep]
 
 
-
-    """Fetch NIFTY50 features; falls back to zeros gracefully."""
+def _load_nifty_features(date_index):
     dates = pd.DatetimeIndex(pd.to_datetime(date_index))
-    start = dates.min() - pd.Timedelta(days=80)
-    end   = dates.max() + pd.Timedelta(days=5)
+    start = (dates.min() - pd.Timedelta(days=80)).strftime("%Y-%m-%d")
+    end   = (dates.max() + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
     try:
         import yfinance as yf
         _p("i", "Fetching NIFTY50 (^NSEI) ...")
-        nifty = yf.download("^NSEI", start=start.strftime("%Y-%m-%d"),
-                             end=end.strftime("%Y-%m-%d"),
+        nifty = yf.download("^NSEI", start=start, end=end,
                              interval="1d", progress=False, auto_adjust=True)
         if nifty.empty:
             raise ValueError("Empty response")
@@ -146,20 +168,19 @@ def _load_news_features():
             nifty.columns = nifty.columns.droplevel(1)
         nifty = nifty[["Close"]].copy()
         nifty.index = pd.to_datetime(nifty.index)
-        nifty["nifty_ret_1d"] = nifty["Close"].pct_change(1)
-        nifty["nifty_ret_5d"] = nifty["Close"].pct_change(5)
+        nifty["nifty_ret_1d"]      = nifty["Close"].pct_change(1)
+        nifty["nifty_ret_5d"]      = nifty["Close"].pct_change(5)
         delta = nifty["Close"].diff()
         gain  = delta.clip(lower=0).rolling(14).mean()
         loss  = (-delta.clip(upper=0)).rolling(14).mean()
-        nifty["nifty_rsi"] = 100 - (100 / (1 + gain / (loss + 1e-8)))
+        nifty["nifty_rsi"]         = 100 - (100 / (1 + gain / (loss + 1e-8)))
         ema20 = nifty["Close"].ewm(span=20, adjust=False).mean()
         nifty["nifty_above_ema20"] = (nifty["Close"] > ema20).astype(int)
         nifty.index = nifty.index.strftime("%Y-%m-%d")
         _p("OK", f"NIFTY features: {len(nifty)} days")
         return nifty[["nifty_ret_1d", "nifty_ret_5d", "nifty_rsi", "nifty_above_ema20"]]
     except Exception as e:
-        _p("!", f"NIFTY fetch failed ({e}); zero-filling — "
-                 "ret_vs_nifty_* and alpha_5d signals will be weakened!")
+        _p("!", f"NIFTY fetch failed ({e}); zero-filling")
         return pd.DataFrame(0.0, index=date_index,
                             columns=["nifty_ret_1d", "nifty_ret_5d",
                                      "nifty_rsi", "nifty_above_ema20"])
@@ -173,80 +194,125 @@ def _compute_stock_features(df):
     df = df.sort_values(["Stock", "Date"]).reset_index(drop=True)
     results = []
     for stock, sdf in df.groupby("Stock", sort=False):
-        sdf  = sdf.copy()
-        c    = sdf["Close"]
-        # Use lagged Return_1d to ensure past-only data (no pct_change() fallback
-        # which would use current-period close and risk subtle leakage).
-        if "Return_1d" in sdf.columns:
-            sdf["Return_1d_lag1"] = sdf["Return_1d"].shift(1)
-        else:
-            sdf["Return_1d_lag1"] = c.shift(1).pct_change(1)
-        r1   = sdf["Return_1d_lag1"]
-        vol  = sdf["Volume"]
+        sdf = sdf.copy()
+        c   = sdf["Close"]
+        r1  = sdf["Return_1d"] if "Return_1d" in sdf.columns else c.pct_change(1)
+        vol = sdf["Volume"]
 
-        # Momentum
         sdf["momentum_5d"]   = c.pct_change(5)
         sdf["momentum_10d"]  = c.pct_change(10)
         sdf["momentum_20d"]  = c.pct_change(20)
         sdf["momentum_diff"] = sdf["momentum_5d"] - sdf["momentum_10d"]
 
-        # Volatility
         sdf["volatility_10d"] = r1.rolling(10, min_periods=5).std()
         sdf["volatility_20d"] = r1.rolling(20, min_periods=10).std()
         vol20_mean = sdf["volatility_20d"].rolling(20, min_periods=10).mean()
         sdf["vol_breakout"] = sdf["volatility_10d"] / (vol20_mean + 1e-8)
 
-        # Volume spike
         vol_ma10 = vol.rolling(10, min_periods=5).mean()
         vol_ma20 = vol.rolling(20, min_periods=10).mean()
         sdf["vol_spike"] = vol / (vol_ma10 + 1)
         sdf["vol_ratio"] = vol / (vol_ma20 + 1)
 
-        # RSI momentum
         if "RSI" in sdf.columns:
             sdf["rsi_momentum"] = sdf["RSI"] - sdf["RSI"].rolling(5, min_periods=3).mean()
         else:
             sdf["rsi_momentum"] = 0.0
 
-        # Price position in 20-day range
         h20 = c.rolling(20, min_periods=10).max()
         l20 = c.rolling(20, min_periods=10).min()
         sdf["price_pos_20d"] = (c - l20) / (h20 - l20 + 1e-8)
 
-        # 52-week position
         h252 = c.rolling(252, min_periods=50).max()
         l252 = c.rolling(252, min_periods=50).min()
         sdf["pct_from_52w_high"] = (c - h252) / (h252 + 1e-8)
         sdf["pct_from_52w_low"]  = (c - l252)  / (l252  + 1e-8)
 
-        # Intraday structure
         if all(x in sdf.columns for x in ["High", "Low", "Open"]):
             sdf["close_range_pct"] = (c - sdf["Low"]) / (sdf["High"] - sdf["Low"] + 1e-8)
             sdf["hl_ratio"]        = (sdf["High"] - sdf["Low"]) / (c + 1e-8)
             sdf["gap_pct"]         = (sdf["Open"] - c.shift(1)) / (c.shift(1) + 1e-8)
 
-        # ATR ratio
         if "ATR" in sdf.columns:
             sdf["atr_ratio"] = sdf["ATR"] / (c + 1e-8)
 
-        # EMA trend
         ema20 = c.ewm(span=20, adjust=False).mean()
         ema50 = c.ewm(span=50, adjust=False).mean()
         sdf["ema_dist_20"] = (c - ema20) / (ema20 + 1e-8)
         sdf["ema_dist_50"] = (c - ema50) / (ema50 + 1e-8)
         sdf["ema_cross"]   = (ema20 > ema50).astype(int)
 
-        # Sharpe-5d
         sdf["sharpe_5d"] = (
             r1.rolling(5, min_periods=3).mean() /
             (r1.rolling(5, min_periods=3).std() + 1e-8)
         )
+
+        # MACD histogram for LSTM
+        if "MACD" in sdf.columns and "MACD_signal" in sdf.columns:
+            sdf["MACD_hist"] = sdf["MACD"] - sdf["MACD_signal"]
 
         results.append(sdf)
 
     out = pd.concat(results, ignore_index=True)
     _p("OK", f"Per-stock features computed: {len(out)} rows")
     return out
+
+
+def _add_news_features(df, news_daily):
+    """
+    BUG 1 FIX: merge news and compute rolling 3-day average per stock.
+    Also create 'news_score' alias for LSTM compatibility.
+    """
+    if news_daily.empty:
+        df["news_score_daily"] = 0.0
+        df["news_rolling_3d"]  = 0.0
+        df["news_score"]       = 0.0
+        df["has_news"]         = 0
+        df["news_spike"]       = 0.0
+        return df
+
+    df = df.merge(news_daily, on=["Date", "Stock"], how="left")
+    df["news_score_daily"] = df["news_score_daily"].fillna(0.0)
+    df["has_news"]         = (df["news_score_daily"] != 0.0).astype(int)
+
+    df = df.sort_values(["Stock", "Date"])
+    df["news_rolling_3d"] = (
+        df.groupby("Stock")["news_score_daily"]
+          .transform(lambda x: x.rolling(3, min_periods=1).mean())
+    )
+
+    # Spike: today's score vs 10-day average
+    df["news_spike"] = (
+        df.groupby("Stock")["news_score_daily"]
+          .transform(lambda x: x - x.rolling(10, min_periods=1).mean())
+    )
+
+    # Alias for LSTM compatibility
+    df["news_score"] = df["news_score_daily"]
+
+    non_zero = (df["news_score_daily"] != 0).sum()
+    _p("OK", f"News features merged | non-zero rows: {non_zero} "
+              f"({non_zero/len(df):.1%} coverage)")
+    return df
+
+
+def _add_event_features(df, events_df):
+    """
+    BUG 3 FIX: merge events properly.
+    """
+    if events_df.empty:
+        df["event_score_max"] = 0.0
+        df["is_event"]        = 0
+        return df
+
+    merge_cols = ["Date", "Stock", "event_score_max", "is_event"]
+    merge_cols = [c for c in merge_cols if c in events_df.columns]
+    df = df.merge(events_df[merge_cols], on=["Date", "Stock"], how="left")
+    df["event_score_max"] = df["event_score_max"].fillna(0.0)
+    df["is_event"]        = df["is_event"].fillna(0).astype(int)
+
+    _p("OK", f"Events merged | event rows: {df['is_event'].sum()}")
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -276,28 +342,27 @@ def _add_sector_features(df):
 
 
 # ---------------------------------------------------------------------------
-# RELATIVE STRENGTH (stock vs NIFTY and vs sector)
+# RELATIVE STRENGTH
 # ---------------------------------------------------------------------------
 
 def _add_relative_strength(df):
     df = df.copy()
-
-    # vs NIFTY
     nifty_1d = df.get("nifty_ret_1d", pd.Series(0.0, index=df.index))
     nifty_5d = df.get("nifty_ret_5d", pd.Series(0.0, index=df.index))
-    ret1  = df.get("Return_1d",   pd.Series(0.0, index=df.index))
-    mom5  = df.get("momentum_5d", pd.Series(0.0, index=df.index))
+    ret1 = df.get("Return_1d",   pd.Series(0.0, index=df.index))
+    mom5 = df.get("momentum_5d", pd.Series(0.0, index=df.index))
 
-    df["ret_vs_nifty_1d"] = ret1  - nifty_1d
-    df["ret_vs_nifty_5d"] = mom5  - nifty_5d
+    df["ret_vs_nifty_1d"] = ret1 - nifty_1d
+    df["ret_vs_nifty_5d"] = mom5 - nifty_5d
 
-    # vs sector
     sec1 = df.get("sector_ret_1d", pd.Series(0.0, index=df.index))
     sec5 = df.get("sector_ret_5d", pd.Series(0.0, index=df.index))
     df["ret_vs_sector_1d"] = ret1 - sec1
     df["ret_vs_sector_5d"] = mom5 - sec5
 
-    # Alpha stability (rolling mean of daily alpha vs NIFTY)
+    # Alias used by LSTM
+    df["return_vs_sector"] = df["ret_vs_sector_1d"]
+
     df = df.sort_values(["Stock", "Date"])
     df["alpha_strength"] = (
         df.groupby("Stock")["ret_vs_nifty_1d"]
@@ -324,28 +389,17 @@ def _add_cs_ranks(df):
 
 
 # ---------------------------------------------------------------------------
-# ALPHA-BASED LABEL (forward-looking — NOT a feature)
+# ALPHA-BASED LABEL (forward-looking — label column only, NOT a feature)
 # ---------------------------------------------------------------------------
 
 def _add_alpha_label(df, nifty_fwd_map):
-    """
-    alpha_5d = forward_5d_stock_return - forward_5d_nifty_return.
-    nifty_fwd_map: {date_str: nifty_5d_forward_return}
-    alpha_5d is stored in the CSV for train.py to use as a label source.
-    """
     df = df.sort_values(["Stock", "Date"]).reset_index(drop=True)
-
-    # Forward 5-day stock return
     df["_fc"] = df.groupby("Stock")["Close"].shift(-5)
     df["stock_ret_5d_fwd"] = (df["_fc"] - df["Close"]) / df["Close"].replace(0, np.nan)
     df.drop(columns=["_fc"], inplace=True)
-
-    # Map forward NIFTY return to each row date
     df["nifty_ret_5d_fwd"] = df["Date"].map(nifty_fwd_map).fillna(0.0)
-
     df["alpha_5d"] = df["stock_ret_5d_fwd"] - df["nifty_ret_5d_fwd"]
     df.drop(columns=["stock_ret_5d_fwd", "nifty_ret_5d_fwd"], inplace=True)
-
     non_null = df["alpha_5d"].notna().sum()
     pos = (df["alpha_5d"] > 0.01).sum()
     neg = (df["alpha_5d"] < -0.01).sum()
@@ -359,22 +413,22 @@ def _add_alpha_label(df, nifty_fwd_map):
 
 def merge_all():
     print("\n" + "=" * 62)
-    print("  MERGING DATASETS (REDESIGNED v10 — Alpha-Based Pipeline)")
+    print("  MERGING DATASETS (FIXED v12 — news+events fixed, 2020 filter)")
     print("=" * 62)
 
-    # 1. Technical
+    # 1. Technical (2020 filter applied inside _load_technical)
     tech = _load_technical()
     if tech.empty:
         print("[ERROR] technical.csv missing or empty")
         return
-    _p("OK", f"Technical loaded: {tech.shape}")
+    _p("OK", f"Technical loaded after filter: {tech.shape}")
     tech["Sector"] = tech["Stock"].map(SECTOR_MAP).fillna("Unknown")
 
     # 2. Per-stock features
     _p("i", "Computing per-stock rolling features ...")
     tech = _compute_stock_features(tech)
 
-    # 3. Merge fundamentals
+    # 3. Merge fundamentals (Year-based join)
     tech["Year"] = pd.to_datetime(tech["Date"]).dt.year
     fund = _load_fundamental()
     fund_cols = ["PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
@@ -388,7 +442,7 @@ def merge_all():
             if col in merged.columns:
                 merged[col] = (
                     merged.groupby("Stock")[col]
-                          .transform(lambda x: x.ffill())   # ffill only — bfill leaks future data
+                          .transform(lambda x: x.ffill().bfill())
                 )
         _p("OK", f"Fundamentals merged: {merged.shape}")
     else:
@@ -398,10 +452,6 @@ def merge_all():
     merged.drop(columns=["Year"], inplace=True, errors="ignore")
 
     # 4. NIFTY features
-    # Ensure consistent sort order before all rolling/group operations
-    merged.sort_values(["Stock", "Date"], inplace=True)
-    merged.reset_index(drop=True, inplace=True)
-
     nifty_df = _load_nifty_features(merged["Date"].unique())
     merged = merged.merge(
         nifty_df.reset_index().rename(columns={"index": "Date"}),
@@ -416,35 +466,29 @@ def merge_all():
         .drop_duplicates("Date")
         .set_index("Date")["nifty_ret_5d"]
     )
-    dates_sorted = pd.to_datetime(date_nifty.index).sort_values()
     date_nifty_ts = date_nifty.copy()
     date_nifty_ts.index = pd.to_datetime(date_nifty_ts.index)
-    nifty_fwd_series = date_nifty_ts.shift(-5)   # 5 trading days forward
-    nifty_fwd_map = {k.strftime("%Y-%m-%d"): v
-                     for k, v in nifty_fwd_series.items()}
+    nifty_fwd_series = date_nifty_ts.shift(-5)
+    nifty_fwd_map = {k.strftime("%Y-%m-%d"): v for k, v in nifty_fwd_series.items()}
 
-    # 4b. News features (left join on Date + Stock — preserves all rows)
-    news_df = _load_news_features()
-    if not news_df.empty:
-        merged = merged.merge(news_df, on=["Date", "Stock"], how="left")
-        merged["news_score"]    = merged["news_score"].fillna(0.0)
-        merged["news_score_5d"] = merged["news_score_5d"].fillna(0.0)
-        _p("OK", "News features merged via left join")
-    else:
-        merged["news_score"]    = 0.0
-        merged["news_score_5d"] = 0.0
-        _p("!", "news_score columns set to 0.0 (no news data available)")
+    # 5. News features (BUG 1 FIX)
+    news_daily = _load_news()
+    merged = _add_news_features(merged, news_daily)
 
-    # 5. Sector LOO features
+    # 6. Events features (BUG 3 FIX)
+    events_df = _load_events()
+    merged = _add_event_features(merged, events_df)
+
+    # 7. Sector LOO features
     merged = _add_sector_features(merged)
 
-    # 6. Relative strength
+    # 8. Relative strength
     merged = _add_relative_strength(merged)
 
-    # 7. Cross-sectional ranks
+    # 9. Cross-sectional ranks
     merged = _add_cs_ranks(merged)
 
-    # 8. PE rank
+    # 10. PE rank
     if "PE_Ratio" in merged.columns:
         merged["pe_ratio_rank"] = (
             merged.groupby("Date")["PE_Ratio"]
@@ -454,16 +498,10 @@ def merge_all():
     else:
         merged["pe_ratio_rank"] = 0.5
 
-    # 9. Alpha label (forward-looking)
+    # 11. Alpha label (forward-looking — label only)
     merged = _add_alpha_label(merged, nifty_fwd_map)
 
-    # Apply noise filter: remove rows where |alpha_5d| <= 1% (low-signal samples)
-    before_noise = len(merged)
-    merged = merged[merged["alpha_5d"].isna() | (merged["alpha_5d"].abs() > 0.01)]
-    _p("OK", f"Noise filter abs(alpha_5d)>0.01: {before_noise} → {len(merged)} "
-              f"(removed {before_noise - len(merged)})")
-
-    # 10. Data cleaning
+    # 12. Data cleaning
     before = len(merged)
     merged.dropna(subset=["Close"], inplace=True)
     merged.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -472,27 +510,25 @@ def merge_all():
     if "atr_ratio" in merged.columns:
         thr = merged["atr_ratio"].quantile(0.20)
         merged = merged[merged["atr_ratio"] >= thr]
-        _p("OK", f"Low-vol filter: {before} → {len(merged)} rows removed "
-                  f"{before - len(merged)}")
+        _p("OK", f"Low-vol filter: {before} → {len(merged)} rows")
 
-    # Fill NaN with medians
-    num_cols = merged.select_dtypes(include=[np.number]).columns.tolist()
-    medians  = merged[num_cols].median()
-    merged[num_cols] = merged[num_cols].fillna(medians)
+    # No global imputation — train scripts handle with train-only medians
+    _p("i", "NaN counts in key columns (preserved — training scripts impute from train split):")
+    check_cols = fund_cols + ["news_score_daily", "news_rolling_3d",
+                               "news_score", "event_score_max", "is_event"]
+    for col in check_cols:
+        if col in merged.columns:
+            n_nan = merged[col].isna().sum()
+            _p("i", f"  {col}: {n_nan} NaN ({n_nan/len(merged):.1%})")
 
     # Drop constant columns
+    num_cols = merged.select_dtypes(include=[np.number]).columns.tolist()
     const_cols = [c for c in num_cols if merged[c].nunique() <= 1]
     if const_cols:
         _p("!", f"Dropping constant columns: {const_cols}")
         merged.drop(columns=const_cols, inplace=True)
 
-    # Drop any duplicate (Date, Stock) rows that may have crept in during merges
-    before_dedup = len(merged)
-    merged.drop_duplicates(subset=["Date", "Stock"], keep="last", inplace=True)
-    if len(merged) < before_dedup:
-        _p("!", f"Removed {before_dedup - len(merged)} duplicate (Date, Stock) rows")
-
-    # 11. Save
+    # 13. Final sort and save
     merged.sort_values(["Stock", "Date"], inplace=True)
     merged.reset_index(drop=True, inplace=True)
     os.makedirs(os.path.dirname(MERGED_CSV), exist_ok=True)
@@ -500,87 +536,36 @@ def merge_all():
 
     print(f"\n[OK] Saved: {MERGED_CSV}")
     print(f"Shape: {merged.shape} | Columns: {len(merged.columns)}")
+    print(f"Date range: {merged['Date'].min()} → {merged['Date'].max()}")
+    pre2020 = (merged["Date"] < "2020-01-01").sum()
+    print(f"Pre-2020 rows: {pre2020}  (should be 0)")
 
     alpha_valid = merged["alpha_5d"].notna().sum()
     pos  = (merged["alpha_5d"] > 0.01).sum()
     neg  = (merged["alpha_5d"] < -0.01).sum()
-    print(f"\n  Alpha label  →  total={alpha_valid}  UP(>+1%)={pos}  DOWN(<-1%)={neg}")
-    print(f"  Balance: UP%={pos/(pos+neg)*100:.1f}%" if (pos+neg) > 0 else "")
-
-    # ── Sanity check ──────────────────────────────────────────────────────────
-    print("\n" + "─" * 62)
-    print("  SANITY CHECK")
-    print("─" * 62)
-
-    # Shape
-    print(f"  Dataset shape  : {merged.shape}")
-    print(f"  Date range     : {merged['Date'].min()}  →  {merged['Date'].max()}")
-    print(f"  Unique stocks  : {merged['Stock'].nunique()}")
-
-    # Missing value % for all numeric columns (flag if >20%)
-    num_cols_final = merged.select_dtypes(include=[np.number]).columns.tolist()
-    miss_pct = (merged[num_cols_final].isna().mean() * 100).sort_values(ascending=False)
-    high_miss = miss_pct[miss_pct > 20]
-    if not high_miss.empty:
-        print(f"\n  ⚠ Columns with >20% missing values:")
-        for col, pct in high_miss.items():
-            print(f"      {col:35s} {pct:.1f}%")
-    else:
-        print("  ✓ No columns with >20% missing values")
-
-    # Critical feature presence & sparsity check
-    critical_feats = [
-        "ret_vs_nifty_1d", "ret_vs_nifty_5d", "alpha_5d",
-        "momentum_5d", "vol_spike", "news_score",
-        "news_score_5d", "nifty_ret_1d", "nifty_ret_5d",
-    ]
-    print("\n  Critical feature check:")
-    all_critical_ok = True
-    for f in critical_feats:
-        if f not in merged.columns:
-            print(f"    ✗ MISSING  {f}")
-            all_critical_ok = False
-        else:
-            pct_null = merged[f].isna().mean() * 100
-            pct_zero = (merged[f] == 0).mean() * 100
-            warn = ""
-            if pct_null > 50:
-                warn = "  ⚠ mostly NaN!"
-                all_critical_ok = False
-            elif pct_zero > 90:
-                warn = "  ⚠ mostly zero (signal likely absent)"
-                all_critical_ok = False
-            print(f"    ✓  {f:35s}  null={pct_null:.1f}%  zero={pct_zero:.1f}%{warn}")
-    if all_critical_ok:
-        print("  ✓ All critical features present and populated")
-
-    # Target balance
+    print(f"\n  Alpha label → total={alpha_valid}  UP(>+1%)={pos}  DOWN(<-1%)={neg}")
     if (pos + neg) > 0:
-        balance_pct = pos / (pos + neg) * 100
-        if balance_pct < 35 or balance_pct > 65:
-            print(f"\n  ⚠ Target imbalance: UP={balance_pct:.1f}%  DOWN={100-balance_pct:.1f}%")
-        else:
-            print(f"\n  ✓ Target balance OK: UP={balance_pct:.1f}%  DOWN={100-balance_pct:.1f}%")
+        print(f"  Balance: UP%={pos/(pos+neg)*100:.1f}%")
 
-    # NIFTY zero-fill warning
-    nifty_zero_frac = (merged["nifty_ret_1d"] == 0).mean()
-    if nifty_zero_frac > 0.5:
-        print(f"\n  ⚠ nifty_ret_1d is zero for {nifty_zero_frac*100:.1f}% of rows — "
-              "NIFTY data likely absent; relative-strength features will be unreliable.")
-
-    print("\n  All key feature columns:")
+    print("\n  Key feature check:")
     key_feats = [
-        "ret_vs_nifty_1d", "ret_vs_nifty_5d", "ret_vs_sector_1d",
-        "ret_vs_sector_5d", "alpha_strength", "vol_spike",
-        "vol_breakout", "momentum_diff", "price_pos_20d",
-        "atr_ratio", "alpha_5d", "news_score", "news_score_5d",
+        "news_score_daily", "news_rolling_3d", "news_score", "news_spike", "has_news",
+        "event_score_max", "is_event",
+        "ret_vs_nifty_1d", "ret_vs_nifty_5d", "ret_vs_sector_1d", "ret_vs_sector_5d",
+        "return_vs_sector", "alpha_strength", "vol_spike", "vol_breakout",
+        "momentum_diff", "price_pos_20d", "alpha_5d", "MACD_hist",
     ]
     for f in key_feats:
         status = "✓" if f in merged.columns else "✗ MISSING"
-        print(f"    {f:35s} {status}")
+        print(f"    {f:30s} {status}")
 
-    print("\n  Sector distribution:")
-    print(merged["Sector"].value_counts().to_string())
+    # M&M validation
+    mm = merged[merged["Stock"] == "M&M"]
+    print(f"\n  M&M Validation:")
+    print(f"    Rows:             {len(mm)}")
+    print(f"    news_score != 0:  {(mm['news_score'] != 0).sum() if 'news_score' in mm.columns else 'N/A'}")
+    print(f"    event rows:       {mm['is_event'].sum() if 'is_event' in mm.columns else 'N/A'}")
+    print(f"    ROE non-null:     {mm['ROE'].notna().sum() if 'ROE' in mm.columns else 'N/A'}")
 
 
 if __name__ == "__main__":

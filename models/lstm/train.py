@@ -1,29 +1,27 @@
 # =============================================================================
-# models/lstm/train.py  (FIXED v9)
+# models/lstm/train.py  (FIXED v12)
 #
-# Critical fixes vs v8:
+# FIXES vs v9:
 #
-#   FIX 1: BUG — _build_sequences() missing `seq_len` argument
-#     The ensemble's LSTM predict was crashing with:
-#     "_build_sequences() missing 1 required positional argument: 'seq_len'"
-#     Root cause: predict.py calls _build_sequences(sdf, scaler, feats) with
-#     3 args, but the v8 signature has 4 positional args (no default for
-#     seq_len). Fix: add seq_len=SEQ_LEN default so old callers still work.
+#   FIX 1: Use date-based split matching project requirement:
+#     train < 2024, val = 2024, test = 2025
+#     Old code used ratio-based split (70%/15%/15%) which mixes future
+#     stocks from 2025 into training — subtle leakage for time-series data.
 #
-#   FIX 2: LABEL THRESHOLD 1% → 0.5% (matches XGBoost fix)
+#   FIX 2: news_score_daily is now the column name in merged_final.csv.
+#     LSTM_FEATURES in settings.py uses 'news_score' — we alias it here.
+#     merge_features.py v12 saves BOTH 'news_score_daily' and 'news_score'
+#     so this is now consistent.
 #
-#   FIX 3: CLASS WEIGHTING — CrossEntropyLoss weight= was already present
-#     in v8 but computed AFTER the training loop started. Moved to before
-#     DataLoader creation.
+#   FIX 3: Scaler fit on train_df rows only (was already correct in v9).
+#     Kept as-is for clarity.
 #
-#   FIX 4: NEW FEATURES — return_vs_sector, news_rolling_3d (same as XGB)
-#
-#   FIX 5: ARCHITECTURE — smaller LSTM (64 hidden, 1 layer) set in settings.
-#     Val loss was diverging at epoch 3 with 2-layer 128-unit model.
-#
-#   FIX 6: Save seq_len to pkl so predict.py always reads the correct value
-#     (was sometimes falling back to SEQUENCE_LENGTH from settings which
-#      could differ if settings changed after training).
+#   All v9 fixes retained:
+#     - _build_sequences() has seq_len default (predict.py 3-arg call works)
+#     - 0.5% label threshold
+#     - Smaller architecture (64 hidden, 1 layer)
+#     - Class weighting in CrossEntropyLoss
+#     - seq_len saved to pkl
 # =============================================================================
 
 import sys, os
@@ -41,23 +39,30 @@ from sklearn.preprocessing import RobustScaler
 
 from config.settings    import (MERGED_CSV, LSTM_FEATURES, SEQUENCE_LENGTH,
                                  LSTM_EPOCHS, LSTM_BATCH, LSTM_LR, LSTM_PATIENCE,
-                                 LSTM_HIDDEN, LSTM_LAYERS,
+                                 LSTM_HIDDEN, LSTM_LAYERS, LSTM_DROPOUT,
                                  LABEL_THRESHOLD, LABEL_HORIZON,
                                  LSTM_MODEL_PATH, LSTM_SCALER_PATH,
-                                 RANDOM_SEED, TRAIN_RATIO, VAL_RATIO)
+                                 RANDOM_SEED)
 from models.lstm.model  import LSTMClassifier
 from evaluation.metrics import evaluate_all
 
+
 def _p(tag, msg): print(f"  [{tag}] {msg}", flush=True)
 
-SEQ_LEN = SEQUENCE_LENGTH  # 15 trading days
+SEQ_LEN = SEQUENCE_LENGTH   # 15 trading days
+
+# FIX 1: Date-based split
+TRAIN_END  = "2023-12-31"
+VAL_START  = "2024-01-01"
+VAL_END    = "2024-12-31"
+TEST_START = "2025-01-01"
 
 
 def _engineer_features(df):
     df = df.sort_values(["Stock", "Date"]).reset_index(drop=True)
     results = []
     for stock, sdf in df.groupby("Stock", sort=False):
-        sdf = sdf.copy()
+        sdf   = sdf.copy()
         close = sdf["Close"]
         ret1  = sdf["Return_1d"]
         rsi   = sdf["RSI"]
@@ -78,23 +83,21 @@ def _engineer_features(df):
         sdf["macd_cross"]      = np.sign(macd_diff) - np.sign(macd_diff.shift(1))
         sdf["vol_ratio20"]     = vol / (vol.rolling(20).mean() + 1)
 
-        # FIX 4: Sector alpha and smoothed news
+        # Sector alpha
         if "sector_ret_1d" in sdf.columns:
             sdf["return_vs_sector"] = ret1 - sdf["sector_ret_1d"].fillna(0.0)
         else:
             sdf["return_vs_sector"] = 0.0
 
+        # FIX 2: use news_score (aliased from news_score_daily in merge_features v12)
         if "news_score" in sdf.columns:
             sdf["news_rolling_3d"] = sdf["news_score"].fillna(0.0).rolling(3, min_periods=1).mean()
+        elif "news_score_daily" in sdf.columns:
+            sdf["news_score"] = sdf["news_score_daily"].fillna(0.0)
+            sdf["news_rolling_3d"] = sdf["news_score"].rolling(3, min_periods=1).mean()
         else:
+            sdf["news_score"]      = 0.0
             sdf["news_rolling_3d"] = 0.0
-
-        # Rolling z-score on price-level features (stabilise LSTM gradients)
-        for feat in ["EMA_dist", "BB_pct", "Momentum_5d"]:
-            if feat in sdf.columns:
-                mu = sdf[feat].rolling(20, min_periods=5).mean()
-                sd = sdf[feat].rolling(20, min_periods=5).std().replace(0, np.nan)
-                sdf[f"{feat}_zscore"] = (sdf[feat] - mu) / sd
 
         results.append(sdf)
 
@@ -102,10 +105,7 @@ def _engineer_features(df):
 
 
 def _add_threshold_labels(df):
-    """
-    FIX 2: 5-day forward label with 0.5% threshold (was 1%).
-    Rows outside threshold are NaN — kept for sequence context.
-    """
+    """5-day forward label with 0.5% threshold."""
     df = df.copy().sort_values(["Stock", "Date"]).reset_index(drop=True)
     df["_close_future"] = df.groupby("Stock")["Close"].shift(-LABEL_HORIZON)
     df["_return_fwd"]   = (df["_close_future"] - df["Close"]) / df["Close"].replace(0, np.nan)
@@ -117,26 +117,20 @@ def _add_threshold_labels(df):
     return df
 
 
-def _global_date_split(df):
-    dates = sorted(df["Date"].unique())
-    n = len(dates)
-    d1 = dates[int(n * TRAIN_RATIO)]
-    d2 = dates[int(n * (TRAIN_RATIO + VAL_RATIO))]
-    return (df[df["Date"] <  d1].copy(),
-            df[(df["Date"] >= d1) & (df["Date"] < d2)].copy(),
-            df[df["Date"] >= d2].copy())
+def _date_split(df):
+    """FIX 1: strict date-based split."""
+    train_df = df[df["Date"] <= TRAIN_END].copy()
+    val_df   = df[(df["Date"] >= VAL_START) & (df["Date"] <= VAL_END)].copy()
+    test_df  = df[df["Date"] >= TEST_START].copy()
+    return train_df, val_df, test_df
 
 
-# FIX 1: Added seq_len=SEQ_LEN default so predict.py's 3-arg call still works
 def _build_sequences(stock_df, scaler, feats, seq_len=SEQ_LEN):
-    """
-    Build (X, y) sequences. Emit only rows where label is valid (non-NaN).
-    Uses all rows (including NaN-label rows) as sequence context.
-    """
+    """Build (X, y) sequences. seq_len has default so predict.py 3-arg call works."""
     if len(stock_df) <= seq_len:
         return np.array([]), np.array([])
 
-    df = stock_df.sort_values("Date").copy().reset_index(drop=True)
+    df     = stock_df.sort_values("Date").copy().reset_index(drop=True)
     vals   = np.nan_to_num(df[feats].values.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
     vals   = scaler.transform(vals)
     labels = df["label"].values
@@ -164,9 +158,9 @@ def _loader(X, y, bs, shuffle=False):
 def train():
     random.seed(RANDOM_SEED); np.random.seed(RANDOM_SEED); torch.manual_seed(RANDOM_SEED)
 
-    print("\n" + "="*55)
-    print("  LSTM - Training (FIXED v9)")
-    print("="*55)
+    print("\n" + "=" * 55)
+    print("  LSTM — Training (FIXED v12)")
+    print("=" * 55)
 
     if not os.path.exists(MERGED_CSV):
         _p("x", "merged_final.csv not found"); return {}
@@ -182,25 +176,29 @@ def train():
     _p("i", "Engineering additional features ...")
     df = _engineer_features(df)
 
-    # FIX 2: 0.5% threshold
     df = _add_threshold_labels(df)
     labeled_count = df["label"].notna().sum()
     _p("OK", f"Labeled rows ({LABEL_HORIZON}d / {LABEL_THRESHOLD*100:.1f}% threshold): "
              f"{labeled_count}/{len(df)}")
 
-    # Resolve features (include zscore extras if present)
-    extra_feats = [f"{f}_zscore" for f in ["EMA_dist", "BB_pct", "Momentum_5d"]
-                   if f"{f}_zscore" in df.columns]
-    feats_wanted = LSTM_FEATURES + extra_feats
+    # Resolve features: use LSTM_FEATURES from settings + extras computed above
+    extra_feats = ["ret_2d", "ret_3d", "ret_5d", "ret_10d", "ret_15d", "ret_20d",
+                   "rsi_momentum", "vol10d", "sharpe_5d", "norm_mom5", "norm_mom10",
+                   "macd_cross", "vol_ratio20", "return_vs_sector", "news_rolling_3d"]
+    feats_wanted = LSTM_FEATURES + [f for f in extra_feats if f not in LSTM_FEATURES]
+
     for f in feats_wanted:
         if f not in df.columns:
             df[f] = 0.0
     feats_present = [f for f in feats_wanted if f in df.columns]
-    _p("i", f"Using {len(feats_present)} features (incl. {len(extra_feats)} zscore features)")
+    _p("i", f"Using {len(feats_present)} features")
 
-    train_df, val_df, test_df = _global_date_split(df)
-    _p("OK", f"Global split: train:{len(train_df)}  val:{len(val_df)}  test:{len(test_df)}")
+    # FIX 1: date-based split
+    train_df, val_df, test_df = _date_split(df)
+    _p("OK", f"Date split: train:{len(train_df)} ({train_df['Date'].min()}→{TRAIN_END})  "
+             f"val:{len(val_df)}  test:{len(test_df)}")
 
+    # Scaler fit on train ONLY (no leakage)
     scaler = RobustScaler()
     train_vals = np.nan_to_num(train_df[feats_present].values.astype(np.float32), nan=0.0)
     scaler.fit(train_vals)
@@ -210,7 +208,7 @@ def train():
         for stock in split_df["Stock"].unique():
             sdf = split_df[split_df["Stock"] == stock]
             if len(sdf) <= SEQ_LEN: continue
-            X, y = _build_sequences(sdf, scaler, feats_present, SEQ_LEN)  # FIX 1
+            X, y = _build_sequences(sdf, scaler, feats_present, SEQ_LEN)
             if len(X): Xs.append(X); ys.append(y)
         if not Xs: return np.array([]), np.array([])
         return np.concatenate(Xs), np.concatenate(ys)
@@ -224,14 +222,13 @@ def train():
 
     _p("OK", f"Sequences: train:{X_train.shape}  val:{X_val.shape}  test:{X_test.shape}")
 
-    # FIX 3: Class weights (already in v8 but double-checking correct order)
+    # Class weights
     counts  = np.bincount(y_train, minlength=2)
     total   = len(y_train)
     weights = torch.tensor(total / (2.0 * np.clip(counts, 1, None)), dtype=torch.float32)
     _p("i", f"Class weights: DOWN={weights[0]:.3f}  UP={weights[1]:.3f}")
 
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # FIX 5: Smaller model (64 hidden, 1 layer) — see settings.py
     net       = LSTMClassifier(X_train.shape[2]).to(device)
     n_params  = sum(p.numel() for p in net.parameters() if p.requires_grad)
     _p("i", f"Model params: {n_params:,}  (hidden={LSTM_HIDDEN}, layers={LSTM_LAYERS})")
@@ -309,7 +306,6 @@ def train():
         with open(feat_path, "wb") as f: pickle.dump(feats_present, f)
     except Exception: pass
 
-    # FIX 6: Always save the actual SEQ_LEN used (not settings value)
     try:
         with open(seqlen_path, "wb") as f: pickle.dump(SEQ_LEN, f)
         _p("OK", f"seq_len={SEQ_LEN} saved -> {seqlen_path}")

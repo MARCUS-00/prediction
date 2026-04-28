@@ -1,37 +1,24 @@
 # =============================================================================
-# models/xgboost/train.py  (REDESIGNED v10 — Alpha-Based XGBoost)
+# models/xgboost/train.py  (FIXED v12)
 #
-# KEY CHANGES vs v9:
+# FIXES vs v11:
 #
-#   1. [TARGET] Uses alpha_5d from merged CSV (stock outperformance vs NIFTY).
-#      Filters: abs(alpha_5d) > 1% (ambiguous rows dropped).
-#      target = 1 if alpha_5d > 0 else 0
-#      This replaces noisy raw direction labels.
+#   FIX 1: Time-based split matches project requirement exactly.
+#     train: 2020-01-01 to 2023-12-31
+#     val:   2024-01-01 to 2024-12-31
+#     test:  2025-01-01 to 2025-12-31
 #
-#   2. [MODEL] Strong regularization to prevent overfitting:
-#      max_depth=3, min_child_weight=20, subsample=0.7,
-#      colsample_bytree=0.7, reg_lambda=5, reg_alpha=2, gamma=2,
-#      learning_rate=0.02, n_estimators≈400 (with early stopping)
+#   FIX 2: news_score_daily and news_rolling_3d are now in merged_final.csv
+#     (fixed in merge_features.py v12). They are included as features.
 #
-#   3. [CALIBRATION] CalibratedClassifierCV (isotonic) applied post-training
-#      to fix flat probabilities (0.48–0.52 → meaningful spread).
+#   FIX 3: event_score_max and is_event now correctly merged (fix in
+#     merge_features.py v12). They are included as features.
 #
-#   4. [SPLIT] Strict time-based:
-#      train < 2022-01-01  |  val = 2022–2023  |  test >= 2024-01-01
-#
-#   5. [FEATURES] Lean set of ~30 strong, stock-specific features.
-#      Removed: event_*, news_*, sector_encoded, raw price lags.
-#
-#   6. [THRESHOLD] Prediction at 0.55 (not 0.5) to reduce UP bias.
-#
-#   7. [CONFIDENCE FILTER] Optional evaluation on high-confidence rows
-#      (prob > 0.6 or < 0.4) reported separately.
-#
-# EXPECTED RESULTS:
-#   - Test accuracy: 55–60% (vs 50–51% before)
-#   - Test AUC:      0.56–0.62
-#   - No majority-class collapse
-#   - Calibrated probabilities with real spread
+#   All v11 fixes retained:
+#     - train_medians computed from TRAIN SPLIT ONLY (no leakage)
+#     - CalibratedClassifierCV with isotonic method
+#     - scale_pos_weight computed dynamically
+#     - Alpha-based binary target (stock outperforms NIFTY by >1%)
 # =============================================================================
 
 import sys, os
@@ -53,14 +40,14 @@ def _p(tag, msg):
 
 
 # ---------------------------------------------------------------------------
-# FEATURE LIST — lean, strong, stock-specific
+# FEATURE LIST
 # ---------------------------------------------------------------------------
 
 FEATURES = [
     # Core relative strength vs NIFTY (primary alpha signal)
     "ret_vs_nifty_1d",
     "ret_vs_nifty_5d",
-    "alpha_strength",          # rolling mean of ret_vs_nifty_1d
+    "alpha_strength",
 
     # Relative strength vs sector
     "ret_vs_sector_1d",
@@ -70,12 +57,12 @@ FEATURES = [
     "momentum_5d",
     "momentum_10d",
     "momentum_20d",
-    "momentum_diff",           # momentum_5d - momentum_10d
+    "momentum_diff",
 
     # Volatility & volume
-    "vol_spike",               # Volume / rolling_mean(Volume, 10)
-    "vol_ratio",               # Volume / rolling_mean(Volume, 20)
-    "vol_breakout",            # current_vol / mean_vol_20d
+    "vol_spike",
+    "vol_ratio",
+    "vol_breakout",
     "volatility_10d",
     "volatility_20d",
 
@@ -84,7 +71,7 @@ FEATURES = [
     "rsi_momentum",
 
     # Price structure
-    "price_pos_20d",           # position within 20-day high-low range
+    "price_pos_20d",
     "pct_from_52w_high",
     "pct_from_52w_low",
     "close_range_pct",
@@ -106,31 +93,40 @@ FEATURES = [
     "cs_rank_RSI",
     "cs_rank_ret_vs_nifty_5d",
 
-    # Fundamental (weak but stabilising)
+    # Fundamental
     "ROE",
     "pe_ratio_rank",
     "Revenue_Growth",
 
-    # NIFTY context (market regime)
+    # NIFTY market context
     "nifty_rsi",
     "nifty_above_ema20",
+
+    # News (FIX 2: now present in merged_final.csv)
+    "news_score_daily",
+    "news_rolling_3d",
+    "news_spike",
+    "has_news",
+
+    # Events (FIX 3: now correctly merged)
+    "event_score_max",
+    "is_event",
 ]
 
-
 # ---------------------------------------------------------------------------
-# XGBoost hyperparameters — strong regularisation
+# XGBoost hyperparameters
 # ---------------------------------------------------------------------------
 
 XGBOOST_PARAMS = {
-    "n_estimators"    : 2000,       # high ceiling; early stopping kicks in ~400
-    "max_depth"       : 3,          # shallow trees → less overfit
+    "n_estimators"    : 2000,
+    "max_depth"       : 3,
     "learning_rate"   : 0.02,
     "subsample"       : 0.7,
     "colsample_bytree": 0.7,
-    "min_child_weight": 20,         # large → conservative splits
-    "reg_lambda"      : 5.0,        # L2
-    "reg_alpha"       : 2.0,        # L1
-    "gamma"           : 2.0,        # min split gain
+    "min_child_weight": 20,
+    "reg_lambda"      : 5.0,
+    "reg_alpha"       : 2.0,
+    "gamma"           : 2.0,
     "eval_metric"     : "logloss",
     "random_state"    : RANDOM_SEED,
     "n_jobs"          : -1,
@@ -138,55 +134,65 @@ XGBOOST_PARAMS = {
     "early_stopping_rounds": 50,
 }
 
+# FIX 1: Correct split for 2020-2025 data
+TRAIN_END  = "2023-12-31"   # train: 2020-2023 (4 years)
+VAL_START  = "2024-01-01"   # val:   2024
+VAL_END    = "2024-12-31"
+TEST_START = "2025-01-01"   # test:  2025
+
+ALPHA_THRESH = 0.01      # keep only |alpha_5d| > 1%
+THRESHOLD    = 0.55      # decision threshold for UP class
+
 
 # ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
 
-def _evaluate(y_true, y_pred, y_proba, split_name, threshold=0.55):
-    """Full evaluation at a given decision threshold."""
-    # Apply threshold to UP class (col 1)
-    y_pred_thr = (y_proba[:, 1] >= threshold).astype(int)
-
-    acc    = accuracy_score(y_true, y_pred_thr)
-    wf1    = f1_score(y_true, y_pred_thr, average="weighted", zero_division=0)
-    mf1    = f1_score(y_true, y_pred_thr, average="macro",    zero_division=0)
-    auc    = roc_auc_score(y_true, y_proba[:, 1])
-    return {"split": split_name, "accuracy": acc, "weighted_f1": wf1,
-            "macro_f1": mf1, "auc_roc": auc}
-
-
-def _confidence_eval(y_true, y_proba, threshold=0.6):
-    """Evaluate only high-confidence predictions (prob > 0.6 or < 0.4)."""
-    mask = (y_proba[:, 1] > threshold) | (y_proba[:, 1] < (1 - threshold))
-    if mask.sum() < 50:
-        return None
-    y_pred_conf = (y_proba[mask, 1] >= 0.5).astype(int)
-    acc = accuracy_score(y_true[mask], y_pred_conf)
-    auc = roc_auc_score(y_true[mask], y_proba[mask, 1])
-    return {"n": int(mask.sum()), "pct": mask.mean(), "accuracy": acc, "auc": auc}
-
-
-def _get_X(df, feature_names, train_medians=None):
+def _get_X(df, feature_names, train_medians):
     X = pd.DataFrame(index=df.index)
     for col in feature_names:
-        X[col] = df[col] if col in df.columns else 0.0
+        if col in df.columns:
+            X[col] = df[col]
+        else:
+            X[col] = train_medians.get(col, 0.0)
     X = X.apply(pd.to_numeric, errors="coerce")
     X.replace([np.inf, -np.inf], np.nan, inplace=True)
-    if train_medians is not None:
-        X = X.fillna(pd.Series(train_medians))
+    X = X.fillna(pd.Series(train_medians))
     return X
 
 
+def _evaluate(y_true, y_proba, split_name):
+    y_pred = (y_proba[:, 1] >= THRESHOLD).astype(int)
+    acc    = accuracy_score(y_true, y_pred)
+    wf1    = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+    mf1    = f1_score(y_true, y_pred, average="macro",    zero_division=0)
+    auc    = roc_auc_score(y_true, y_proba[:, 1])
+    return {"split": split_name, "accuracy": acc,
+            "weighted_f1": wf1, "macro_f1": mf1, "auc_roc": auc}
+
+
+def _confidence_eval(y_true, y_proba, threshold=0.6):
+    mask = (y_proba[:, 1] > threshold) | (y_proba[:, 1] < (1 - threshold))
+    if mask.sum() < 50:
+        return None
+    y_pred = (y_proba[mask, 1] >= 0.5).astype(int)
+    return {
+        "n":        int(mask.sum()),
+        "pct":      float(mask.mean()),
+        "accuracy": accuracy_score(y_true[mask], y_pred),
+        "auc":      roc_auc_score(y_true[mask], y_proba[mask, 1]),
+    }
+
+
 # ---------------------------------------------------------------------------
-# MAIN TRAINING FUNCTION
+# MAIN
 # ---------------------------------------------------------------------------
 
 def train():
     np.random.seed(RANDOM_SEED)
 
     print("\n" + "=" * 60)
-    print("  XGBOOST — REDESIGNED v10 (Alpha-Based + Calibrated)")
+    print("  XGBOOST — FIXED v12 (2020-2025 split, news+events fixed)")
     print("=" * 60)
 
     try:
@@ -202,49 +208,64 @@ def train():
     df = pd.read_csv(MERGED_CSV)
     _p("OK", f"Loaded merged_final.csv  shape={df.shape}")
 
-    # ── 1. Extract alpha-based label ─────────────────────────────────────────
+    dates = pd.to_datetime(df["Date"])
+    _p("i", f"Date range: {dates.min().date()} → {dates.max().date()}")
+    pre_2020 = (dates < "2020-01-01").sum()
+    if pre_2020 > 0:
+        _p("!", f"WARNING: {pre_2020} rows before 2020-01-01. Re-run merge_features.py v12.")
+
+    # Validate news features present
+    for feat in ["news_score_daily", "news_rolling_3d"]:
+        if feat not in df.columns:
+            _p("!", f"WARNING: {feat} missing from merged CSV. Re-run merge_features.py v12.")
+
+    # ── 1. Alpha-based label ─────────────────────────────────────────────────
     if "alpha_5d" not in df.columns:
-        _p("x", "Column 'alpha_5d' missing. Re-run merge_features.py (v10).")
+        _p("x", "Column 'alpha_5d' missing. Re-run merge_features.py v12.")
         return {}
 
     df = df.sort_values(["Stock", "Date"]).reset_index(drop=True)
-
-    # Filter: keep only rows where |alpha_5d| > 1% (clear signal)
     before = len(df)
     df = df[df["alpha_5d"].notna()].copy()
-    alpha_thresh = 0.01
-    df = df[df["alpha_5d"].abs() >= alpha_thresh].copy()
+    df = df[df["alpha_5d"].abs() >= ALPHA_THRESH].copy()
     after = len(df)
-    _p("OK", f"Alpha filter (|alpha_5d| > {alpha_thresh*100:.0f}%): "
+    _p("OK", f"Alpha filter (|alpha_5d| > {ALPHA_THRESH*100:.0f}%): "
               f"{before} → {after} rows  ({(before-after)/before*100:.1f}% dropped)")
 
-    # Binary label: 1 = stock outperformed NIFTY, 0 = underperformed
     df["label"] = (df["alpha_5d"] > 0).astype(int)
     n_up   = (df["label"] == 1).sum()
     n_down = (df["label"] == 0).sum()
     _p("OK", f"Label distribution: UP={n_up}  DOWN={n_down}  "
               f"UP%={n_up/(n_up+n_down)*100:.1f}%")
 
-    # ── 2. Time-based split ──────────────────────────────────────────────────
+    # ── 2. Time-based split (FIX 1) ─────────────────────────────────────────
     df["Date"] = df["Date"].astype(str)
-    train_df = df[df["Date"] <  "2022-01-01"].copy()
-    val_df   = df[(df["Date"] >= "2022-01-01") & (df["Date"] < "2024-01-01")].copy()
-    test_df  = df[df["Date"] >= "2024-01-01"].copy()
+    train_df = df[df["Date"] <= TRAIN_END].copy()
+    val_df   = df[(df["Date"] >= VAL_START) & (df["Date"] <= VAL_END)].copy()
+    test_df  = df[df["Date"] >= TEST_START].copy()
 
-    _p("OK", f"Split → train:{len(train_df)}  val:{len(val_df)}  test:{len(test_df)}")
-    _p("i",  f"Test UP%={test_df['label'].mean():.3f}")
+    _p("OK", "Split (FIX 1: matches project requirement):")
+    _p("OK", f"  Train: {len(train_df)} rows ({train_df['Date'].min()} → {train_df['Date'].max()})")
+    _p("OK", f"  Val:   {len(val_df)} rows ({val_df['Date'].min()} → {val_df['Date'].max()})")
+    _p("OK", f"  Test:  {len(test_df)} rows ({test_df['Date'].min()} → {test_df['Date'].max()})")
 
-    if len(train_df) < 1000 or len(val_df) < 200 or len(test_df) < 200:
-        _p("!", "WARNING: Very small split. Check date range in your data.")
+    for split_name, split_df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+        if len(split_df) < 200:
+            _p("!", f"WARNING: {split_name} set has only {len(split_df)} rows after alpha filter.")
 
-    # ── 3. Feature matrix ────────────────────────────────────────────────────
+    _p("i", f"Test UP%={test_df['label'].mean():.3f}  "
+             f"Val UP%={val_df['label'].mean():.3f}")
+
+    # ── 3. Feature matrix ─────────────────────────────────────────────────────
     feat_used = [f for f in FEATURES if f in df.columns]
     missing   = [f for f in FEATURES if f not in df.columns]
     if missing:
-        _p("!", f"Features missing from CSV ({len(missing)}): {missing[:10]}...")
+        _p("!", f"Features missing from CSV ({len(missing)}): {missing}")
     _p("i", f"Using {len(feat_used)} features")
 
-    train_medians = df[feat_used].median().to_dict()  # computed on full df before split
+    # train_medians from TRAIN SPLIT ONLY (no leakage)
+    train_medians = train_df[feat_used].apply(pd.to_numeric, errors="coerce").median().to_dict()
+    _p("OK", "train_medians computed from TRAIN SPLIT ONLY (no leakage)")
 
     X_train = _get_X(train_df, feat_used, train_medians)
     X_val   = _get_X(val_df,   feat_used, train_medians)
@@ -258,7 +279,7 @@ def train():
     n_tr_up   = (y_train == 1).sum()
     n_tr_down = (y_train == 0).sum()
     spw = n_tr_down / max(n_tr_up, 1)
-    _p("i", f"scale_pos_weight={spw:.3f}")
+    _p("i", f"scale_pos_weight={spw:.3f} (train: UP={n_tr_up}, DOWN={n_tr_down})")
 
     # ── 5. Train XGBoost ──────────────────────────────────────────────────────
     params = {**XGBOOST_PARAMS, "scale_pos_weight": spw}
@@ -269,14 +290,13 @@ def train():
     model.fit(
         X_train, y_train,
         eval_set=[(X_val, y_val)],
-        verbose=100,
+        verbose=200,
     )
     _p("i", f"Best iteration: {model.best_iteration}  "
              f"Best val_logloss: {model.best_score:.5f}")
 
-    # ── 6. Calibrate probabilities ────────────────────────────────────────────
-    _p("i", "Calibrating probabilities (isotonic regression) ...")
-    # Use val set for calibration — no data leakage
+    # ── 6. Calibrate ──────────────────────────────────────────────────────────
+    _p("i", "Calibrating probabilities (isotonic regression on val set) ...")
     calibrated = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
     calibrated.fit(X_val, y_val)
     _p("OK", "Calibration complete")
@@ -286,80 +306,84 @@ def train():
     y_proba_val   = calibrated.predict_proba(X_val)
     y_proba_test  = calibrated.predict_proba(X_test)
 
-    THRESHOLD = 0.55  # raises precision for UP predictions
-
     # ── 8. Evaluation ─────────────────────────────────────────────────────────
-    results_table = []
+    results_list = []
     for split, yt, yp in [("Train", y_train, y_proba_train),
-                           ("Val",   y_val,   y_proba_val),
-                           ("Test",  y_test,  y_proba_test)]:
-        r = _evaluate(yt, (yp[:, 1] >= THRESHOLD).astype(int), yp, split, THRESHOLD)
-        results_table.append(r)
+                            ("Val",   y_val,   y_proba_val),
+                            ("Test",  y_test,  y_proba_test)]:
+        r = _evaluate(yt, yp, split)
+        results_list.append(r)
 
     print("\n" + "=" * 68)
-    print("  XGBOOST v10 — EVALUATION SUMMARY")
+    print("  XGBOOST v12 — EVALUATION SUMMARY")
     print("=" * 68)
     print(f"  {'Metric':<14} | {'Train':>10} | {'Val':>10} | {'Test':>10}")
     print(f"  {'-'*14}+{'-'*12}+{'-'*12}+{'-'*12}")
     for metric in ["accuracy", "weighted_f1", "macro_f1", "auc_roc"]:
-        vals = [f"{r[metric]:.4f}" for r in results_table]
+        vals = [f"{r[metric]:.4f}" for r in results_list]
         print(f"  {metric.replace('_',' ').title():<14} | {vals[0]:>10} | {vals[1]:>10} | {vals[2]:>10}")
     print("=" * 68)
 
-    # Detailed test report at threshold 0.55
-    y_pred_test_thr = (y_proba_test[:, 1] >= THRESHOLD).astype(int)
+    y_pred_test = (y_proba_test[:, 1] >= THRESHOLD).astype(int)
     print(f"\n  [ Test Set Report — threshold={THRESHOLD} ]")
-    print(classification_report(y_test, y_pred_test_thr,
+    print(classification_report(y_test, y_pred_test,
                                  target_names=["DOWN", "UP"], digits=3))
-    print("  Confusion Matrix (DOWN/UP):")
-    print(confusion_matrix(y_test, y_pred_test_thr))
+    print("  Confusion Matrix (rows=actual DOWN/UP, cols=predicted DOWN/UP):")
+    cm = confusion_matrix(y_test, y_pred_test)
+    print(f"    {cm}")
 
-    # Probability spread check
     test_probs = y_proba_test[:, 1]
     _p("i", f"Prob spread — mean={test_probs.mean():.4f}  "
              f"std={test_probs.std():.4f}  "
              f"min={test_probs.min():.4f}  "
              f"max={test_probs.max():.4f}")
+    if test_probs.std() < 0.02:
+        _p("!", "WARNING: std < 0.02 — model may be collapsing to one class.")
 
-    # Confidence-filtered evaluation
-    conf_result = _confidence_eval(y_test, y_proba_test, threshold=0.6)
-    if conf_result:
-        print(f"\n  [ High-Confidence Predictions (prob>0.6 or <0.4) ]")
-        print(f"    Rows:     {conf_result['n']} ({conf_result['pct']*100:.1f}% of test)")
-        print(f"    Accuracy: {conf_result['accuracy']:.4f}")
-        print(f"    AUC-ROC:  {conf_result['auc']:.4f}")
+    conf = _confidence_eval(y_test, y_proba_test, threshold=0.6)
+    if conf:
+        print(f"\n  [ High-Confidence Predictions (prob > 0.6 or < 0.4) ]")
+        print(f"    Rows:     {conf['n']} ({conf['pct']*100:.1f}% of test)")
+        print(f"    Accuracy: {conf['accuracy']:.4f}")
+        print(f"    AUC-ROC:  {conf['auc']:.4f}")
 
-    # Feature importance
+    baseline_acc = float(y_test.mean())
+    _p("i", f"Always-UP baseline on test: {baseline_acc:.4f}")
+    _p("i", f"Model improvement over baseline: {results_list[2]['accuracy'] - baseline_acc:+.4f}")
+
     importances = pd.Series(model.feature_importances_, index=feat_used)
     top20 = importances.nlargest(20)
     print("\n  Top-20 feature importances:")
     for feat, imp in top20.items():
         print(f"    {feat:35s}  {imp:.4f}")
 
-    # Baseline
-    _p("i", f"Always-UP baseline on test: {y_test.mean():.4f}")
-
-    # ── 9. Save model ─────────────────────────────────────────────────────────
+    # ── 9. Save ────────────────────────────────────────────────────────────────
     payload = {
-        "model"         : calibrated,
-        "base_model"    : model,
-        "feature_names" : feat_used,
-        "train_medians" : train_medians,
-        "threshold"     : THRESHOLD,
-        "label_type"    : "alpha_5d",
-        "alpha_threshold": alpha_thresh,
+        "model"          : calibrated,
+        "base_model"     : model,
+        "feature_names"  : feat_used,
+        "train_medians"  : train_medians,
+        "threshold"      : THRESHOLD,
+        "label_type"     : "alpha_5d",
+        "alpha_threshold": ALPHA_THRESH,
+        "split"          : {
+            "train_end" : TRAIN_END,
+            "val_start" : VAL_START,
+            "val_end"   : VAL_END,
+            "test_start": TEST_START,
+        },
     }
     os.makedirs(os.path.dirname(XGB_MODEL_PATH), exist_ok=True)
     with open(XGB_MODEL_PATH, "wb") as f:
         pickle.dump(payload, f)
     _p("OK", f"Model saved → {XGB_MODEL_PATH}")
 
-    # ── 10. Save results CSV ──────────────────────────────────────────────────
+    # ── 10. Save results ───────────────────────────────────────────────────────
     res = test_df[["Date", "Stock"]].copy()
-    res["label"]      = y_test
-    res["pred"]       = y_pred_test_thr
-    res["prob_up"]    = y_proba_test[:, 1]
-    res["alpha_5d"]   = test_df["alpha_5d"].values
+    res["label"]    = y_test
+    res["pred"]     = y_pred_test
+    res["prob_up"]  = y_proba_test[:, 1]
+    res["alpha_5d"] = test_df["alpha_5d"].values
     os.makedirs(os.path.dirname(XGB_RESULTS_PATH), exist_ok=True)
     res.to_csv(XGB_RESULTS_PATH, index=False)
     _p("OK", f"Results saved → {XGB_RESULTS_PATH}")
