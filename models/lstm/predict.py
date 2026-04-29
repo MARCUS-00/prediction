@@ -3,46 +3,66 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import logging
 import torch
+import pickle
+import joblib
 import numpy as np
 import pandas as pd
 
-from config.settings import LSTM_MODEL_PATH, DEVICE
+# Removed DEVICE import to prevent the ImportError
+from config.settings import LSTM_MODEL_PATH
 from models.lstm.model import LSTMClassifier
 
 log = logging.getLogger("lstm_predict")
 
 def load_lstm():
     """
-    Loads the trained PyTorch LSTM model with robust dictionary key extraction.
+    Loads the trained PyTorch LSTM model.
+    Automatically finds device and external scaler/feature files.
     """
     if not os.path.exists(LSTM_MODEL_PATH):
         raise FileNotFoundError(f"Model not found at {LSTM_MODEL_PATH}. Train it first.")
     
-    device = torch.device(DEVICE)
-    # Load the checkpoint
+    # 1. Auto-detect device instead of relying on settings
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     checkpoint = torch.load(LSTM_MODEL_PATH, map_location=device, weights_only=False)
+    model_dir = os.path.dirname(LSTM_MODEL_PATH)
     
-    # --- ROBUST KEY EXTRACTION ---
-    # Claude might have used different names, so we check all common possibilities
-    feature_cols = checkpoint.get("feature_cols", 
-                   checkpoint.get("features", 
-                   checkpoint.get("feature_names", [])))
-                   
-    scaler = checkpoint.get("scaler", checkpoint.get("scaler_obj", None))
+    # 2. Extract state dict
+    state = checkpoint.get("model_state_dict", checkpoint.get("state_dict", checkpoint)) if isinstance(checkpoint, dict) else checkpoint
     
-    state = checkpoint.get("model_state_dict", 
-            checkpoint.get("state_dict", checkpoint))
+    # 3. Load Features (Checks dictionary first, then looks for the .pkl file)
+    feature_cols = []
+    if isinstance(checkpoint, dict) and "feature_cols" in checkpoint:
+        feature_cols = checkpoint["feature_cols"]
+    else:
+        feat_path = os.path.join(model_dir, "lstm_features.pkl")
+        if os.path.exists(feat_path):
+            with open(feat_path, "rb") as f:
+                feature_cols = pickle.load(f)
+                
+    # 4. Load Scaler (Checks dictionary first, then looks for the .pkl file)
+    scaler = None
+    if isinstance(checkpoint, dict) and "scaler" in checkpoint:
+        scaler = checkpoint["scaler"]
+    else:
+        scaler_path = os.path.join(model_dir, "lstm_scaler.pkl")
+        if os.path.exists(scaler_path):
+            scaler = joblib.load(scaler_path)
             
-    seq_len = checkpoint.get("seq_len", 
-              checkpoint.get("sequence_length", 15))
-    
-    if not feature_cols:
-        log.error(f"Checkpoint keys available: {list(checkpoint.keys())}")
-        raise ValueError("Feature columns missing in LSTM checkpoint. See available keys above.")
+    # 5. Sequence Length
+    seq_len = 15
+    if isinstance(checkpoint, dict) and "seq_len" in checkpoint:
+        seq_len = checkpoint["seq_len"]
         
-    input_size = len(feature_cols)
-    
-    # Initialize the model with num_classes=3 to match our trained weights
+    # 6. Initialize the model
+    if not feature_cols:
+        log.warning("Could not locate feature names! Defaulting input_size to 25 based on previous logs.")
+        input_size = 25
+    else:
+        input_size = len(feature_cols)
+        
+    # Initialize with num_classes=3 to match our trained weights
     net = LSTMClassifier(
         input_size=input_size, 
         hidden_size=64, 
@@ -70,7 +90,7 @@ def predict_proba(X_tensor, model=None):
     if model is None:
         model = load_lstm()
         
-    device = torch.device(DEVICE)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
     
@@ -90,12 +110,15 @@ def predict_single(stock_df):
     try:
         model = load_lstm()
         
-        X_raw = stock_df[model.feature_cols].copy()
+        X_raw = stock_df[model.feature_cols].copy() if model.feature_cols else stock_df.copy()
         X_raw.replace([np.inf, -np.inf], np.nan, inplace=True)
         X_raw.ffill(inplace=True)
         X_raw.fillna(0, inplace=True)
         
-        X_scaled = model.scaler.transform(X_raw)
+        if model.scaler:
+            X_scaled = model.scaler.transform(X_raw)
+        else:
+            X_scaled = X_raw.values
         
         if len(X_scaled) < model.seq_len:
             pad_size = model.seq_len - len(X_scaled)
@@ -115,7 +138,7 @@ if __name__ == "__main__":
     try:
         model = load_lstm()
         print("LSTM model loaded successfully!")
-        print(f"Features expected: {len(model.feature_cols)}")
+        print(f"Features expected: {len(model.feature_cols) if model.feature_cols else 'Unknown'}")
         print(f"Sequence Length: {model.seq_len}")
     except Exception as e:
         print(f"Error loading model: {e}")
