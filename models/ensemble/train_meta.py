@@ -230,7 +230,6 @@ def train():
         random_state=RANDOM_SEED,
         C=0.1,
         solver="lbfgs",
-        multi_class="multinomial",
         class_weight="balanced",
     )
     min_class_count = min(cc.values())

@@ -134,7 +134,7 @@ def predict_proba(df_or_tensor, payload=None):
     """
     Accept either:
       • a numpy array / torch.Tensor of shape (N, seq_len, input_size)  [batch mode]
-      • a pandas DataFrame with feature columns  [single-stock mode]
+      • a pandas DataFrame with feature columns  [multi-row mode]
 
     Returns ndarray shape (N, 3): [P(DOWN), P(FLAT), P(UP)]
     """
@@ -142,9 +142,9 @@ def predict_proba(df_or_tensor, payload=None):
     device = next(model.parameters()).device
     model.eval()
 
-    # ── Convert DataFrame → tensor ───────────────────────────────────────────
+    # ── Convert DataFrame → (N, 3) via per-stock sliding windows ────────────
     if isinstance(df_or_tensor, pd.DataFrame):
-        return predict_single(df_or_tensor, model)
+        return predict_dataframe(df_or_tensor, model)
 
     # ── Tensor / ndarray path ─────────────────────────────────────────────────
     X = df_or_tensor
@@ -157,23 +157,13 @@ def predict_proba(df_or_tensor, payload=None):
     return probs
 
 
-def predict_single(stock_df: pd.DataFrame, model=None) -> np.ndarray:
-    """
-    Predict 3-class probabilities for a single stock DataFrame.
-    Returns ndarray shape (3,) for a single prediction,
-    or (N, 3) if multiple rows are passed and all form a sequence.
-    """
-    if model is None:
-        model = load_lstm()
-
-    device = next(model.parameters()).device
-    model.eval()
-
+def _prepare_features(stock_df: pd.DataFrame, model) -> np.ndarray:
+    """Extract, clean, and scale feature matrix from a DataFrame."""
     feat_cols = model.feature_cols or []
     if feat_cols:
         missing = [c for c in feat_cols if c not in stock_df.columns]
         if missing:
-            log.warning(f"predict_single: missing features {missing}, filling with 0")
+            log.warning(f"predict: missing features {missing}, filling with 0")
         X_raw = stock_df.reindex(columns=feat_cols, fill_value=0.0)
     else:
         X_raw = stock_df.select_dtypes(include=[np.number])
@@ -191,7 +181,89 @@ def predict_single(stock_df: pd.DataFrame, model=None) -> np.ndarray:
         except Exception as e:
             log.warning(f"Scaler transform failed: {e}; using raw values")
 
+    return X_np
+
+
+def predict_dataframe(df: pd.DataFrame, model=None) -> np.ndarray:
+    """
+    Predict 3-class probabilities for every row in a multi-stock DataFrame.
+
+    For each row i, the model receives a sliding window of seq_len rows
+    ending at i (within the same stock). Rows with fewer than seq_len
+    predecessors are zero-padded at the front.
+
+    Returns ndarray shape (N, 3).
+    """
+    if model is None:
+        model = load_lstm()
+
+    device = next(model.parameters()).device
+    model.eval()
+
     seq_len = model.seq_len or SEQUENCE_LENGTH
+    n = len(df)
+    result = np.full((n, NUM_CLASS), np.nan, dtype=np.float32)
+
+    df_index = list(df.index)
+
+    # Group by stock so sequences don't bleed across tickers
+    stock_col = "Stock" if "Stock" in df.columns else None
+    groups = df.groupby(stock_col).groups if stock_col else {"_all": df.index}
+
+    for ticker, idx in groups.items():
+        sub = df.loc[idx].sort_values("Date") if "Date" in df.columns else df.loc[idx]
+        orig_indices = list(sub.index)
+
+        X_np = _prepare_features(sub, model)
+        total = len(X_np)
+
+        # Pad front so we can always extract a full seq_len window
+        pad_rows = max(seq_len - 1, 0)
+        if pad_rows > 0:
+            pad = np.zeros((pad_rows, X_np.shape[1]), dtype=np.float32)
+            X_padded = np.vstack([pad, X_np])
+        else:
+            X_padded = X_np
+
+        # Build one window per original row using the padded array
+        windows = np.stack([
+            X_padded[i: i + seq_len]          # shape (seq_len, n_feat)
+            for i in range(total)              # i=0 -> rows [0..seq_len-1] of X_padded
+        ])                                     # -> (total, seq_len, n_feat)
+
+        X_tensor = torch.tensor(windows, dtype=torch.float32).to(device)
+
+        BATCH = 512
+        probs_list = []
+        with torch.no_grad():
+            for b in range(0, len(X_tensor), BATCH):
+                out = torch.softmax(model(X_tensor[b: b + BATCH]), dim=1)
+                probs_list.append(out.cpu().numpy())
+
+        probs = np.vstack(probs_list)  # (total, 3)
+
+        # Map back to original DataFrame row positions
+        for local_i, orig_idx in enumerate(orig_indices):
+            flat_i = df_index.index(orig_idx)
+            result[flat_i] = probs[local_i]
+
+    return result
+
+
+def predict_single(stock_df: pd.DataFrame, model=None) -> np.ndarray:
+    """
+    Predict 3-class probabilities for a single stock's most-recent window.
+    Returns ndarray shape (3,).
+    """
+    if model is None:
+        model = load_lstm()
+
+    device = next(model.parameters()).device
+    model.eval()
+
+    X_np = _prepare_features(stock_df, model)
+    seq_len = model.seq_len or SEQUENCE_LENGTH
+
     if len(X_np) < seq_len:
         pad = np.zeros((seq_len - len(X_np), X_np.shape[1]), dtype=np.float32)
         X_np = np.vstack([pad, X_np])
