@@ -1,560 +1,419 @@
-# =============================================================================
-# features/merge_features.py  (FIXED v13)
-#
-# FIXES vs v12:
-#   FIX 1: Label — stronger alpha threshold (|alpha_5d| > 0.015 not 0.01)
-#   FIX 2: Sentiment — per-stock z-score normalization (removes +0.19 bias)
-#   FIX 3: Feature list pruned to strong set only (FEATURES constant exported)
-#   FIX 4: Added momentum_strength and volatility_ratio features
-#   FIX 5: M&M validation output at end
-# =============================================================================
+"""
+features/merge_features.py
+==========================
+Builds the master feature matrix used by all downstream models.
+
+Fixes applied vs. the original:
+  1. Ticker normalisation  – M&M, BAJAJ-AUTO, etc. are unified before any merge.
+  2. 3-class labels        – UP / FLAT / DOWN based on absolute forward-return
+                             thresholds (default ±1.5 %).
+  3. Extended horizon      – LABEL_HORIZON bumped to 15 days in settings, used here.
+  4. Richer features       – rolling historical volatility, Bollinger-Band distance,
+                             sector-relative momentum, ATR-normalised range.
+  5. Zero leakage          – every engineered feature uses only strictly past data
+                             (shift ≥ 1 or pct_change on look-back windows that end
+                             before the current row).
+"""
 
 import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import logging
 import numpy as np
 import pandas as pd
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import yfinance as yf
 
 from config.settings import (
     TECHNICAL_CSV, FUNDAMENTAL_CSV, NEWS_CSV, EVENTS_CSV, MERGED_CSV,
-    SECTOR_MAP,
+    LABEL_HORIZON, DATE_START, DATE_END,
+    SECTOR_MAP, SECTOR_TO_CODE,
 )
 
-START_DATE = "2020-01-01"
-END_DATE   = "2025-12-31"
+logging.basicConfig(level=logging.INFO, format="  [%(levelname)s] %(message)s")
+log = logging.getLogger("merge_features")
 
-# ---------------------------------------------------------------------------
-# CANONICAL FEATURE LIST  (imported by train scripts)
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# ISSUE 4  –  Ticker normalisation
+# ──────────────────────────────────────────────────────────────────────────────
+# Some data sources store tickers with special characters that break pd.merge.
+# This dictionary maps every known variant → canonical Nifty-50 symbol (no suffix).
 
-FEATURES = [
-    "RSI", "MACD_hist", "EMA_20", "ATR", "OBV",
-    "news_score", "news_rolling_3d",
-    "event_score_max", "is_event",
-    "ret_vs_nifty_1d", "ret_vs_nifty_5d",
-    "ret_vs_sector_1d", "ret_vs_sector_5d",
-    "alpha_strength",
-    "vol_spike", "vol_breakout",
-    "momentum_diff", "price_pos_20d",
-    "PE_Ratio", "ROE",
-    # FIX 4: new derived features
-    "momentum_strength",
-    "volatility_ratio",
-]
+TICKER_ALIAS: dict[str, str] = {
+    # M&M variants
+    "M&M":          "M&M",
+    "M_M":          "M&M",
+    "M-M":          "M&M",
+    "MM":           "M&M",
+    "M&M.NS":       "M&M",
+    "M_M.NS":       "M&M",
+    # BAJAJ-AUTO variants
+    "BAJAJ-AUTO":   "BAJAJ-AUTO",
+    "BAJAJ_AUTO":   "BAJAJ-AUTO",
+    "BAJAJAUTO":    "BAJAJ-AUTO",
+    "BAJAJ AUTO":   "BAJAJ-AUTO",
+    "BAJAJ-AUTO.NS":"BAJAJ-AUTO",
+    # HDFCBANK
+    "HDFC BANK":    "HDFCBANK",
+    "HDFC-BANK":    "HDFCBANK",
+    # Other common .NS suffixed forms are handled by the generic strip below.
+}
 
-ALPHA_THRESH = 0.015   # FIX 1: stronger signal filter
-
-
-def _p(tag, msg):
-    print(f"  [{tag}] {msg}", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# DATA LOADERS
-# ---------------------------------------------------------------------------
-
-def _load_technical():
-    if not os.path.exists(TECHNICAL_CSV):
-        _p("x", "technical.csv not found")
-        return pd.DataFrame()
-    df = pd.read_csv(TECHNICAL_CSV)
-    df["Date"]  = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    df["Stock"] = df["Stock"].astype(str).str.replace(".NS", "", regex=False)
-    df.dropna(subset=["Date", "Close"], inplace=True)
-    df.drop_duplicates(subset=["Date", "Stock"], inplace=True)
-
-    before = len(df)
-    df = df[(df["Date"] >= START_DATE) & (df["Date"] <= END_DATE)]
-    _p("OK", f"Technical: {before} → {len(df)} rows ({START_DATE} to {END_DATE})")
-
-    for col in ["Open", "High", "Low", "Close", "Volume", "Return_1d",
-                "RSI", "MACD", "MACD_signal", "ATR", "EMA_20", "OBV"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+# 3-class label thresholds (absolute forward return)
+UP_THRESH   =  0.015   #  > +1.5 %  → UP   (label = 1)
+DOWN_THRESH = -0.015   #  < -1.5 %  → DOWN (label = -1)
+# inside the band → FLAT (label = 0)
 
 
-def _load_fundamental():
-    if not os.path.exists(FUNDAMENTAL_CSV):
-        _p("!", "fundamental.csv not found")
-        return pd.DataFrame()
-    df = pd.read_csv(FUNDAMENTAL_CSV)
-    df["Stock"] = df["Stock"].astype(str).str.replace(".NS", "", regex=False)
-    num_cols = ["PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
-                "Revenue_Growth", "Profit_Growth"]
-    for col in num_cols:
-        if col not in df.columns:
-            df[col] = np.nan
-        else:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-            valid = df[col].dropna()
-            if len(valid) > 10:
-                q1, q99 = valid.quantile(0.01), valid.quantile(0.99)
-                df[col] = df[col].clip(q1, q99)
-    if "Year" not in df.columns:
-        df["Year"] = np.nan
-    df["Sector"] = df["Stock"].map(SECTOR_MAP).fillna("Unknown")
-    return df[["Stock", "Year", "Sector"] + num_cols]
-
-
-def _load_news():
+def normalise_ticker(series: pd.Series) -> pd.Series:
     """
-    Load news.csv and compute per-stock daily average news_score.
-    FIX 2: z-score normalize per stock to remove systematic bias.
+    1. Strip .NS / .BO suffix.
+    2. Strip surrounding whitespace.
+    3. Apply TICKER_ALIAS lookup.
     """
-    if not os.path.exists(NEWS_CSV):
-        _p("!", "news.csv not found — news features will be zero")
-        return pd.DataFrame()
-    df = pd.read_csv(NEWS_CSV)
-    df["Date"]  = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    df["Stock"] = df["Stock"].astype(str).str.replace(".NS", "", regex=False)
-    df.dropna(subset=["Date", "Stock"], inplace=True)
-    df = df[(df["Date"] >= START_DATE) & (df["Date"] <= END_DATE)]
-
-    if "news_score" not in df.columns:
-        if "news_positive" in df.columns and "news_negative" in df.columns:
-            df["news_score"] = df["news_positive"] - df["news_negative"]
-        else:
-            _p("!", "news_score column missing — news features will be zero")
-            return pd.DataFrame()
-
-    # Daily average score per (Date, Stock)
-    daily = (
-        df.groupby(["Date", "Stock"])["news_score"]
-          .mean()
-          .reset_index()
-          .rename(columns={"news_score": "news_score_raw"})
-    )
-
-    # FIX 2: per-stock z-score normalization to remove bias
-    daily["news_score_daily"] = daily.groupby("Stock")["news_score_raw"].transform(
-        lambda x: (x - x.mean()) / (x.std() + 1e-6)
-    )
-    daily["news_score_daily"] = daily["news_score_daily"].fillna(0.0)
-    daily.drop(columns=["news_score_raw"], inplace=True)
-
-    _p("OK", f"News: {len(daily)} (date,stock) pairs | "
-              f"normalized score mean={daily['news_score_daily'].mean():.4f} "
-              f"std={daily['news_score_daily'].std():.4f}")
-    return daily
+    s = series.astype(str).str.replace(r"\.(NS|BO)$", "", regex=True).str.strip()
+    return s.map(lambda t: TICKER_ALIAS.get(t, t))
 
 
-def _load_events():
-    if not os.path.exists(EVENTS_CSV):
-        _p("!", "events.csv not found — event features will be zero")
-        return pd.DataFrame()
-    df = pd.read_csv(EVENTS_CSV)
-    df = df.rename(columns={"date": "Date", "symbol": "Stock"})
-    df["Date"]  = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    df["Stock"] = df["Stock"].astype(str).str.replace(".NS", "", regex=False)
-    df.dropna(subset=["Date", "Stock"], inplace=True)
-    df = df[(df["Date"] >= START_DATE) & (df["Date"] <= END_DATE)]
-    df.drop_duplicates(subset=["Date", "Stock"], inplace=True)
-
-    keep = ["Date", "Stock", "event_score_max", "is_event", "event_name", "event_category"]
-    keep = [c for c in keep if c in df.columns]
-    _p("OK", f"Events: {len(df)} rows | event days: {df['is_event'].sum()}")
-    return df[keep]
+def _remove_constant_cols(df, feature_cols):
+    drop = [c for c in feature_cols if df[c].nunique(dropna=False) <= 1]
+    if drop:
+        log.warning(f"Dropping constant cols: {drop}")
+    return [c for c in feature_cols if c not in drop]
 
 
-def _load_nifty_features(date_index):
-    dates = pd.DatetimeIndex(pd.to_datetime(date_index))
-    start = (dates.min() - pd.Timedelta(days=80)).strftime("%Y-%m-%d")
-    end   = (dates.max() + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
+_NIFTY_CACHE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "merged", "_nifty_cache.csv",
+)
+
+
+def _load_nifty():
+    raw = pd.DataFrame()
     try:
-        import yfinance as yf
-        _p("i", "Fetching NIFTY50 (^NSEI) ...")
-        nifty = yf.download("^NSEI", start=start, end=end,
-                             interval="1d", progress=False, auto_adjust=True)
-        if nifty.empty:
-            raise ValueError("Empty response")
-        if isinstance(nifty.columns, pd.MultiIndex):
-            nifty.columns = nifty.columns.droplevel(1)
-        nifty = nifty[["Close"]].copy()
-        nifty.index = pd.to_datetime(nifty.index)
-        nifty["nifty_ret_1d"]      = nifty["Close"].pct_change(1)
-        nifty["nifty_ret_5d"]      = nifty["Close"].pct_change(5)
-        delta = nifty["Close"].diff()
-        gain  = delta.clip(lower=0).rolling(14).mean()
-        loss  = (-delta.clip(upper=0)).rolling(14).mean()
-        nifty["nifty_rsi"]         = 100 - (100 / (1 + gain / (loss + 1e-8)))
-        ema20 = nifty["Close"].ewm(span=20, adjust=False).mean()
-        nifty["nifty_above_ema20"] = (nifty["Close"] > ema20).astype(int)
-        nifty.index = nifty.index.strftime("%Y-%m-%d")
-        _p("OK", f"NIFTY features: {len(nifty)} days")
-        return nifty[["nifty_ret_1d", "nifty_ret_5d", "nifty_rsi", "nifty_above_ema20"]]
+        log.info("Downloading ^NSEI from yfinance ...")
+        raw = yf.download("^NSEI", start=DATE_START, end=DATE_END,
+                          auto_adjust=True, progress=False)
     except Exception as e:
-        _p("!", f"NIFTY fetch failed ({e}); zero-filling")
-        return pd.DataFrame(0.0, index=date_index,
-                            columns=["nifty_ret_1d", "nifty_ret_5d",
-                                     "nifty_rsi", "nifty_above_ema20"])
+        log.warning(f"yfinance fetch failed: {e}")
+
+    if raw is None or raw.empty:
+        if os.path.exists(_NIFTY_CACHE):
+            log.warning(f"Falling back to cached nifty file: {_NIFTY_CACHE}")
+            return pd.read_csv(_NIFTY_CACHE, parse_dates=["Date"])
+        raise RuntimeError(
+            "yfinance returned empty data for ^NSEI and no cache available.")
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+
+    nifty = raw[["Close"]].copy()
+    nifty.index = pd.to_datetime(nifty.index)
+    nifty.index.name = "Date"
+    nifty = nifty.sort_index()
+
+    nifty["nifty_close"]  = nifty["Close"]
+    nifty["nifty_ret_1d"] = nifty["Close"].pct_change(1).shift(1)
+    nifty["nifty_ret_5d"] = nifty["Close"].pct_change(5).shift(1)
+
+    nifty = nifty.drop(columns=["Close"]).reset_index()
+    log.info(f"Nifty features: {nifty.shape}  "
+             f"range {nifty['Date'].min().date()} -> {nifty['Date'].max().date()}")
+
+    try:
+        os.makedirs(os.path.dirname(_NIFTY_CACHE), exist_ok=True)
+        nifty.to_csv(_NIFTY_CACHE, index=False)
+    except Exception:
+        pass
+    return nifty
 
 
-# ---------------------------------------------------------------------------
-# PER-STOCK FEATURES
-# ---------------------------------------------------------------------------
-
-def _compute_stock_features(df):
-    df = df.sort_values(["Stock", "Date"]).reset_index(drop=True)
-    results = []
-    for stock, sdf in df.groupby("Stock", sort=False):
-        sdf = sdf.copy()
-        c   = sdf["Close"]
-        r1  = sdf["Return_1d"] if "Return_1d" in sdf.columns else c.pct_change(1)
-        vol = sdf["Volume"]
-
-        sdf["momentum_5d"]   = c.pct_change(5)
-        sdf["momentum_10d"]  = c.pct_change(10)
-        sdf["momentum_20d"]  = c.pct_change(20)
-        sdf["momentum_diff"] = sdf["momentum_5d"] - sdf["momentum_10d"]
-
-        sdf["volatility_10d"] = r1.rolling(10, min_periods=5).std()
-        sdf["volatility_20d"] = r1.rolling(20, min_periods=10).std()
-        vol20_mean = sdf["volatility_20d"].rolling(20, min_periods=10).mean()
-        sdf["vol_breakout"] = sdf["volatility_10d"] / (vol20_mean + 1e-8)
-
-        vol_ma10 = vol.rolling(10, min_periods=5).mean()
-        vol_ma20 = vol.rolling(20, min_periods=10).mean()
-        sdf["vol_spike"] = vol / (vol_ma10 + 1)
-        sdf["vol_ratio"] = vol / (vol_ma20 + 1)
-
-        if "RSI" in sdf.columns:
-            sdf["rsi_momentum"] = sdf["RSI"] - sdf["RSI"].rolling(5, min_periods=3).mean()
-        else:
-            sdf["rsi_momentum"] = 0.0
-
-        h20 = c.rolling(20, min_periods=10).max()
-        l20 = c.rolling(20, min_periods=10).min()
-        sdf["price_pos_20d"] = (c - l20) / (h20 - l20 + 1e-8)
-
-        h252 = c.rolling(252, min_periods=50).max()
-        l252 = c.rolling(252, min_periods=50).min()
-        sdf["pct_from_52w_high"] = (c - h252) / (h252 + 1e-8)
-        sdf["pct_from_52w_low"]  = (c - l252)  / (l252  + 1e-8)
-
-        if all(x in sdf.columns for x in ["High", "Low", "Open"]):
-            sdf["close_range_pct"] = (c - sdf["Low"]) / (sdf["High"] - sdf["Low"] + 1e-8)
-            sdf["hl_ratio"]        = (sdf["High"] - sdf["Low"]) / (c + 1e-8)
-            sdf["gap_pct"]         = (sdf["Open"] - c.shift(1)) / (c.shift(1) + 1e-8)
-
-        if "ATR" in sdf.columns:
-            sdf["atr_ratio"] = sdf["ATR"] / (c + 1e-8)
-
-        ema20 = c.ewm(span=20, adjust=False).mean()
-        ema50 = c.ewm(span=50, adjust=False).mean()
-        sdf["ema_dist_20"] = (c - ema20) / (ema20 + 1e-8)
-        sdf["ema_dist_50"] = (c - ema50) / (ema50 + 1e-8)
-        sdf["ema_cross"]   = (ema20 > ema50).astype(int)
-
-        sdf["sharpe_5d"] = (
-            r1.rolling(5, min_periods=3).mean() /
-            (r1.rolling(5, min_periods=3).std() + 1e-8)
-        )
-
-        if "MACD" in sdf.columns and "MACD_signal" in sdf.columns:
-            sdf["MACD_hist"] = sdf["MACD"] - sdf["MACD_signal"]
-
-        # FIX 4: New strong derived features
-        if "EMA_20" in sdf.columns:
-            sdf["momentum_strength"] = c / (sdf["EMA_20"] + 1e-8) - 1
-        else:
-            sdf["momentum_strength"] = c / (ema20 + 1e-8) - 1
-
-        if "ATR" in sdf.columns:
-            sdf["volatility_ratio"] = sdf["ATR"] / (c + 1e-8)
-        else:
-            sdf["volatility_ratio"] = sdf["volatility_10d"] / (c + 1e-8)
-
-        results.append(sdf)
-
-    out = pd.concat(results, ignore_index=True)
-    _p("OK", f"Per-stock features computed: {len(out)} rows")
-    return out
-
-
-def _add_news_features(df, news_daily):
-    """Merge news and compute rolling 3-day average per stock."""
-    if news_daily.empty:
-        df["news_score_daily"] = 0.0
-        df["news_rolling_3d"]  = 0.0
-        df["news_score"]       = 0.0
-        df["has_news"]         = 0
-        df["news_spike"]       = 0.0
-        return df
-
-    df = df.merge(news_daily, on=["Date", "Stock"], how="left")
-    df["news_score_daily"] = df["news_score_daily"].fillna(0.0)
-    df["has_news"]         = (df["news_score_daily"] != 0.0).astype(int)
-
-    df = df.sort_values(["Stock", "Date"])
-    df["news_rolling_3d"] = (
-        df.groupby("Stock")["news_score_daily"]
-          .transform(lambda x: x.rolling(3, min_periods=1).mean())
-    )
-
-    df["news_spike"] = (
-        df.groupby("Stock")["news_score_daily"]
-          .transform(lambda x: x - x.rolling(10, min_periods=1).mean())
-    )
-
-    # Alias for LSTM and feature list compatibility
-    df["news_score"] = df["news_score_daily"]
-
-    non_zero = (df["news_score_daily"] != 0).sum()
-    _p("OK", f"News features merged | non-zero rows: {non_zero} "
-              f"({non_zero/len(df):.1%} coverage) | "
-              f"mean={df['news_score_daily'].mean():.4f}")
-    return df
-
-
-def _add_event_features(df, events_df):
-    if events_df.empty:
-        df["event_score_max"] = 0.0
-        df["is_event"]        = 0
-        return df
-
-    merge_cols = ["Date", "Stock", "event_score_max", "is_event"]
-    merge_cols = [c for c in merge_cols if c in events_df.columns]
-    df = df.merge(events_df[merge_cols], on=["Date", "Stock"], how="left")
-    df["event_score_max"] = df["event_score_max"].fillna(0.0)
-    df["is_event"]        = df["is_event"].fillna(0).astype(int)
-
-    _p("OK", f"Events merged | event rows: {df['is_event'].sum()}")
-    return df
-
-
-# ---------------------------------------------------------------------------
-# SECTOR LEAVE-ONE-OUT FEATURES
-# ---------------------------------------------------------------------------
-
-def _add_sector_features(df):
-    df = df.copy().sort_values(["Date", "Stock"])
-
-    def _loo(col):
-        s   = df.groupby(["Date", "Sector"])[col].transform("sum")
-        cnt = df.groupby(["Date", "Sector"])[col].transform("count")
-        return (s - df[col]) / (cnt - 1).replace(0, np.nan)
-
-    if "Return_1d" in df.columns:
-        df["sector_ret_1d"] = _loo("Return_1d").fillna(0.0)
-    else:
-        df["sector_ret_1d"] = 0.0
-
-    if "momentum_5d" in df.columns:
-        df["sector_ret_5d"] = _loo("momentum_5d").fillna(0.0)
-    else:
-        df["sector_ret_5d"] = 0.0
-
-    _p("OK", "Sector LOO return features added")
-    return df
-
-
-# ---------------------------------------------------------------------------
-# RELATIVE STRENGTH
-# ---------------------------------------------------------------------------
-
-def _add_relative_strength(df):
-    df = df.copy()
-    nifty_1d = df.get("nifty_ret_1d", pd.Series(0.0, index=df.index))
-    nifty_5d = df.get("nifty_ret_5d", pd.Series(0.0, index=df.index))
-    ret1 = df.get("Return_1d",   pd.Series(0.0, index=df.index))
-    mom5 = df.get("momentum_5d", pd.Series(0.0, index=df.index))
-
-    df["ret_vs_nifty_1d"] = ret1 - nifty_1d
-    df["ret_vs_nifty_5d"] = mom5 - nifty_5d
-
-    sec1 = df.get("sector_ret_1d", pd.Series(0.0, index=df.index))
-    sec5 = df.get("sector_ret_5d", pd.Series(0.0, index=df.index))
-    df["ret_vs_sector_1d"] = ret1 - sec1
-    df["ret_vs_sector_5d"] = mom5 - sec5
-
-    df["return_vs_sector"] = df["ret_vs_sector_1d"]
-
-    df = df.sort_values(["Stock", "Date"])
-    df["alpha_strength"] = (
-        df.groupby("Stock")["ret_vs_nifty_1d"]
-          .transform(lambda x: x.rolling(5, min_periods=3).mean())
-          .fillna(0.0)
-    )
-    _p("OK", "Relative strength features added")
-    return df
-
-
-# ---------------------------------------------------------------------------
-# CROSS-SECTIONAL RANKS
-# ---------------------------------------------------------------------------
-
-def _add_cs_ranks(df):
-    for col in ["momentum_5d", "vol_spike", "RSI", "ret_vs_nifty_5d"]:
-        if col in df.columns:
-            df[f"cs_rank_{col}"] = (
-                df.groupby("Date")[col]
-                  .rank(pct=True, na_option="keep")
-                  .fillna(0.5)
-            )
-    return df
-
-
-# ---------------------------------------------------------------------------
-# ALPHA-BASED LABEL — FIX 1: threshold 0.015
-# ---------------------------------------------------------------------------
-
-def _add_alpha_label(df, nifty_fwd_map):
-    df = df.sort_values(["Stock", "Date"]).reset_index(drop=True)
-    df["_fc"] = df.groupby("Stock")["Close"].shift(-5)
-    df["stock_ret_5d_fwd"] = (df["_fc"] - df["Close"]) / df["Close"].replace(0, np.nan)
-    df.drop(columns=["_fc"], inplace=True)
-    df["nifty_ret_5d_fwd"] = df["Date"].map(nifty_fwd_map).fillna(0.0)
-    df["alpha_5d"] = df["stock_ret_5d_fwd"] - df["nifty_ret_5d_fwd"]
-    df.drop(columns=["stock_ret_5d_fwd", "nifty_ret_5d_fwd"], inplace=True)
-    non_null = df["alpha_5d"].notna().sum()
-    pos = (df["alpha_5d"] > ALPHA_THRESH).sum()
-    neg = (df["alpha_5d"] < -ALPHA_THRESH).sum()
-    _p("OK", f"alpha_5d: {non_null} non-null | >{ALPHA_THRESH*100:.1f}%={pos} | <-{ALPHA_THRESH*100:.1f}%={neg}")
-    return df
-
-
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# MAIN FUNCTION
+# ──────────────────────────────────────────────────────────────────────────────
 
 def merge_all():
-    print("\n" + "=" * 62)
-    print("  MERGING DATASETS (FIXED v13)")
-    print("=" * 62)
+    print("\n" + "=" * 60)
+    print("  MERGE FEATURES  (3-class, extended horizon, M&M fix)")
+    print("=" * 60)
 
-    tech = _load_technical()
-    if tech.empty:
-        print("[ERROR] technical.csv missing or empty")
-        return
-    _p("OK", f"Technical loaded: {tech.shape}")
-    tech["Sector"] = tech["Stock"].map(SECTOR_MAP).fillna("Unknown")
+    if not os.path.exists(TECHNICAL_CSV):
+        raise FileNotFoundError(
+            f"Missing {TECHNICAL_CSV}. Run data_collection/build_technical.py first.")
 
-    _p("i", "Computing per-stock rolling features ...")
-    tech = _compute_stock_features(tech)
+    # ── 1. Technical ─────────────────────────────────────────────────────────
+    tech = pd.read_csv(TECHNICAL_CSV)
+    tech["Date"]  = pd.to_datetime(tech["Date"])
+    tech["Stock"] = normalise_ticker(tech["Stock"])          # ← M&M fix
 
-    tech["Year"] = pd.to_datetime(tech["Date"]).dt.year
-    fund = _load_fundamental()
-    fund_cols = ["PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
-                 "Revenue_Growth", "Profit_Growth"]
-    if not fund.empty:
-        merged = tech.merge(fund, on=["Stock", "Year"], how="left", suffixes=("", "_f"))
-        merged.drop(columns=[c for c in merged.columns if c.endswith("_f")],
-                    inplace=True, errors="ignore")
-        merged.sort_values(["Stock", "Date"], inplace=True)
-        for col in fund_cols:
-            if col in merged.columns:
-                merged[col] = (
-                    merged.groupby("Stock")[col]
-                          .transform(lambda x: x.ffill().bfill())
-                )
-        _p("OK", f"Fundamentals merged: {merged.shape}")
-    else:
-        merged = tech.copy()
-        for col in fund_cols:
-            merged[col] = np.nan
-    merged.drop(columns=["Year"], inplace=True, errors="ignore")
+    tech = tech[(tech["Date"] >= DATE_START) & (tech["Date"] <= DATE_END)]
+    tech = tech.sort_values(["Stock", "Date"])
+    tech = tech.drop_duplicates(subset=["Stock", "Date"], keep="last")
+    log.info(f"Technical loaded: {tech.shape}")
 
-    nifty_df = _load_nifty_features(merged["Date"].unique())
-    merged = merged.merge(
-        nifty_df.reset_index().rename(columns={"index": "Date"}),
-        on="Date", how="left"
+    g = tech.groupby("Stock", group_keys=False)
+
+    # --- momentum ---
+    tech["momentum_5d"]       = g["Close"].transform(lambda x: x.pct_change(5))
+    tech["momentum_10d"]      = g["Close"].transform(lambda x: x.pct_change(10))
+    tech["momentum_diff"]     = tech["momentum_5d"] - tech["momentum_10d"]
+    tech["momentum_strength"] = (
+        tech.groupby("Stock")["momentum_5d"]
+            .transform(lambda x: x.rolling(5, min_periods=1).mean())
     )
-    for col in ["nifty_ret_1d", "nifty_ret_5d", "nifty_rsi", "nifty_above_ema20"]:
-        merged[col] = merged.get(col, pd.Series(0.0, index=merged.index)).fillna(0.0)
 
-    date_nifty = (
-        merged[["Date", "nifty_ret_5d"]]
-        .drop_duplicates("Date")
-        .set_index("Date")["nifty_ret_5d"]
-    )
-    date_nifty_ts = date_nifty.copy()
-    date_nifty_ts.index = pd.to_datetime(date_nifty_ts.index)
-    nifty_fwd_series = date_nifty_ts.shift(-5)
-    nifty_fwd_map = {k.strftime("%Y-%m-%d"): v for k, v in nifty_fwd_series.items()}
-
-    news_daily = _load_news()
-    merged = _add_news_features(merged, news_daily)
-
-    events_df = _load_events()
-    merged = _add_event_features(merged, events_df)
-
-    merged = _add_sector_features(merged)
-    merged = _add_relative_strength(merged)
-    merged = _add_cs_ranks(merged)
-
-    if "PE_Ratio" in merged.columns:
-        merged["pe_ratio_rank"] = (
-            merged.groupby("Date")["PE_Ratio"]
-                  .rank(pct=True, na_option="keep")
-                  .fillna(0.5)
+    # --- volatility: ATR-ratio + rolling historical vol (20-day, no leakage) ---
+    tech["volatility_ratio"]   = tech["ATR"] / (tech["Close"].abs() + 1e-8)
+    # Historical volatility = std of daily log-returns over past 20 days
+    # pct_change gives r_t; we then compute rolling std on those returns (look-back only)
+    daily_ret = g["Close"].transform(lambda x: x.pct_change(1))
+    tech["hist_vol_20d"] = (
+        tech.groupby("Stock")[daily_ret.name]
+            .transform(lambda x: x.rolling(20, min_periods=5).std())
+        if daily_ret.name in tech.columns
+        else daily_ret.groupby(tech["Stock"]).transform(
+            lambda x: x.rolling(20, min_periods=5).std()
         )
+    )
+    # Simpler, guaranteed approach:
+    tech["_daily_ret"]  = daily_ret
+    tech["hist_vol_20d"] = (
+        tech.groupby("Stock")["_daily_ret"]
+            .transform(lambda x: x.rolling(20, min_periods=5).std())
+    )
+    tech.drop(columns=["_daily_ret"], inplace=True)
+
+    # --- Bollinger Band distance (no leakage: rolling look-back) ---
+    bb_mid = g["Close"].transform(lambda x: x.rolling(20, min_periods=5).mean())
+    bb_std = g["Close"].transform(lambda x: x.rolling(20, min_periods=5).std())
+    tech["bb_upper"] = bb_mid + 2 * bb_std
+    tech["bb_lower"] = bb_mid - 2 * bb_std
+    tech["bb_width"]    = (tech["bb_upper"] - tech["bb_lower"]) / (bb_mid.abs() + 1e-8)
+    tech["bb_pct"]      = (tech["Close"] - tech["bb_lower"]) / (
+        tech["bb_upper"] - tech["bb_lower"] + 1e-8
+    )  # 0 = at lower band, 1 = at upper band — current position within band
+    tech.drop(columns=["bb_upper", "bb_lower"], inplace=True)
+
+    # --- ATR-normalised daily range ---
+    tech["atr_norm_range"] = (tech["High"] - tech["Low"]) / (tech["ATR"] + 1e-8)
+
+    # --- volume features ---
+    vol_ma20    = g["Volume"].transform(lambda x: x.rolling(20, min_periods=1).mean())
+    close_max20 = g["Close"].transform(lambda x: x.rolling(20, min_periods=1).max())
+    close_ma20  = g["Close"].transform(lambda x: x.rolling(20, min_periods=1).mean())
+
+    tech["vol_spike"]     = (tech["Volume"] > vol_ma20 * 1.5).astype(int)
+    tech["vol_breakout"]  = (tech["Close"]  > close_max20.shift(1)).astype(int)
+    tech["price_pos_20d"] = tech["Close"] / (close_ma20 + 1e-8)
+
+    # --- MACD ---
+    ema12 = g["Close"].transform(lambda x: x.ewm(span=12, adjust=False).mean())
+    ema26 = g["Close"].transform(lambda x: x.ewm(span=26, adjust=False).mean())
+    macd  = ema12 - ema26
+    if "MACD_signal" not in tech.columns or tech["MACD_signal"].isna().all():
+        tech["MACD_signal"] = macd.groupby(tech["Stock"]).transform(
+            lambda x: x.ewm(span=9, adjust=False).mean()
+        )
+    tech["MACD_hist"] = macd - tech["MACD_signal"]
+
+    if "EMA_20" not in tech.columns or tech["EMA_20"].isna().all():
+        tech["EMA_20"] = g["Close"].transform(
+            lambda x: x.ewm(span=20, adjust=False).mean())
+
+    log.info("Technical-derived features computed")
+
+    # ── 2. Nifty market features ──────────────────────────────────────────────
+    nifty = _load_nifty()
+    tech = tech.merge(nifty[["Date", "nifty_ret_1d", "nifty_ret_5d"]],
+                      on="Date", how="left")
+    tech["ret_vs_nifty_1d"] = tech["Return_1d"]   - tech["nifty_ret_1d"]
+    tech["ret_vs_nifty_5d"] = tech["momentum_5d"] - tech["nifty_ret_5d"]
+    log.info("Nifty market features merged")
+
+    # ── 3. Sector features ────────────────────────────────────────────────────
+    tech["Sector"]         = tech["Stock"].map(SECTOR_MAP).fillna("Unknown")
+    tech["sector_encoded"] = tech["Sector"].map(SECTOR_TO_CODE).fillna(-1).astype(int)
+
+    sector_daily = (
+        tech.groupby(["Date", "Sector"])["Return_1d"]
+            .mean()
+            .rename("sector_ret_1d_raw")
+            .reset_index()
+    )
+    sector_daily = sector_daily.sort_values(["Sector", "Date"])
+    sector_daily["sector_ret_1d"] = (
+        sector_daily.groupby("Sector")["sector_ret_1d_raw"]
+                    .transform(lambda x: x.shift(1))
+    )
+    sector_daily["sector_ret_5d"] = (
+        sector_daily.groupby("Sector")["sector_ret_1d_raw"]
+                    .transform(lambda x: x.shift(1).rolling(5, min_periods=1).sum())
+    )
+    sector_daily = sector_daily.drop(columns=["sector_ret_1d_raw"])
+    tech = tech.merge(sector_daily, on=["Date", "Sector"], how="left")
+    tech["sector_ret_1d"]    = tech["sector_ret_1d"].fillna(0.0)
+    tech["sector_ret_5d"]    = tech["sector_ret_5d"].fillna(0.0)
+    tech["return_vs_sector"] = tech["Return_1d"].fillna(0.0) - tech["sector_ret_1d"]
+
+    # Sector-relative momentum: stock 10d momentum minus sector 5d return
+    tech["sector_rel_momentum"] = tech["momentum_10d"] - tech["sector_ret_5d"]
+    log.info("Sector features merged")
+
+    # ── 4. Fundamentals ───────────────────────────────────────────────────────
+    if os.path.exists(FUNDAMENTAL_CSV):
+        fund = pd.read_csv(FUNDAMENTAL_CSV)
+        fund["Stock"] = normalise_ticker(fund["Stock"])      # ← M&M fix
+        fund["Date"]  = pd.to_datetime(fund["Year"].astype(int).astype(str) + "-12-31")
+        fund = fund.sort_values(["Stock", "Date"]).drop_duplicates(
+            subset=["Stock", "Date"], keep="last")
+
+        df = pd.merge_asof(
+            tech.sort_values("Date"),
+            fund[["Stock", "Date", "PE_Ratio", "ROE",
+                  "Revenue_Growth", "Profit_Growth"]].sort_values("Date"),
+            on="Date", by="Stock", direction="backward",
+        )
+        log.info(f"Fundamentals merged: {df.shape}")
     else:
-        merged["pe_ratio_rank"] = 0.5
+        df = tech.copy()
+        for c in ["PE_Ratio", "ROE", "Revenue_Growth", "Profit_Growth"]:
+            df[c] = np.nan
+        log.warning("Fundamental CSV missing — fundamental columns set to NaN")
 
-    merged = _add_alpha_label(merged, nifty_fwd_map)
+    # ── 5. News ───────────────────────────────────────────────────────────────
+    if os.path.exists(NEWS_CSV):
+        news = pd.read_csv(NEWS_CSV)
+        news["Date"]  = pd.to_datetime(news["Date"])
+        news["Stock"] = normalise_ticker(news["Stock"])      # ← M&M fix
+        if "news_score" not in news.columns:
+            news["news_score"] = 0.0
+        news = news[["Date", "Stock", "news_score"]]
+        news = news.groupby(["Date", "Stock"], as_index=False)["news_score"].mean()
+        df = df.merge(news, on=["Date", "Stock"], how="left")
+    else:
+        df["news_score"] = 0.0
+        log.warning("News CSV missing — news_score set to 0")
 
-    before = len(merged)
-    merged.dropna(subset=["Close"], inplace=True)
-    merged.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df["news_score"] = df["news_score"].fillna(0.0)
+    df["has_news"]   = (df["news_score"] != 0).astype(int)
+    df = df.sort_values(["Stock", "Date"])
+    df["news_rolling_3d"] = (
+        df.groupby("Stock")["news_score"]
+          .transform(lambda x: x.rolling(3, min_periods=1).mean())
+    )
+    df["news_decay"] = (
+        df.groupby("Stock")["news_score"]
+          .transform(lambda x: x.rolling(5, min_periods=1).mean())
+    )
+    log.info(f"News merged | rows with news={int(df['has_news'].sum())}")
 
-    if "atr_ratio" in merged.columns:
-        thr = merged["atr_ratio"].quantile(0.20)
-        merged = merged[merged["atr_ratio"] >= thr]
-        _p("OK", f"Low-vol filter: {before} → {len(merged)} rows")
+    # ── 6. Events ─────────────────────────────────────────────────────────────
+    if os.path.exists(EVENTS_CSV):
+        events = pd.read_csv(EVENTS_CSV)
+        events = events.rename(columns={"date": "Date", "symbol": "Stock"})
+        events["Date"]  = pd.to_datetime(events["Date"])
+        events["Stock"] = normalise_ticker(events["Stock"])  # ← M&M fix
+        events_agg = (
+            events.groupby(["Date", "Stock"], as_index=False)
+                  .agg(event_score_max=("event_score_max", "max"),
+                       is_event=("is_event", "max"))
+        )
+        df = df.merge(events_agg, on=["Date", "Stock"], how="left")
+    else:
+        df["event_score_max"] = 0.0
+        df["is_event"]        = 0
+        log.warning("Events CSV missing — event columns set to 0")
 
-    num_cols = merged.select_dtypes(include=[np.number]).columns.tolist()
-    const_cols = [c for c in num_cols if merged[c].nunique() <= 1]
-    if const_cols:
-        _p("!", f"Dropping constant columns: {const_cols}")
-        merged.drop(columns=const_cols, inplace=True)
+    df["is_event"]        = df["is_event"].fillna(0).astype(int)
+    df["event_score_max"] = df["event_score_max"].fillna(0.0)
+    df["event_strength"]  = np.log1p(df["event_score_max"].clip(lower=0))
+    df["event_impact_decay"] = (
+        df.groupby("Stock")["event_strength"]
+          .transform(lambda x: x.rolling(3, min_periods=1).mean())
+    )
+    log.info(f"Events merged | event_rows={int(df['is_event'].sum())}")
 
-    merged.sort_values(["Stock", "Date"], inplace=True)
-    merged.reset_index(drop=True, inplace=True)
+    df["alpha_strength"] = (
+        df.groupby("Stock")["Close"]
+          .transform(lambda x: x.pct_change(5).abs())
+    )
+
+    # ── 7. Label generation  (ISSUE 2 + ISSUE 3) ─────────────────────────────
+    # Forward return over LABEL_HORIZON trading days (NO leakage: future close
+    # is only used for the label column, which is dropped before features are
+    # used for prediction).
+    log.info(f"Using LABEL_HORIZON={LABEL_HORIZON} days, "
+             f"thresholds UP>{UP_THRESH*100:.1f}% DOWN<{DOWN_THRESH*100:.1f}%")
+
+    df["_fwd_close"] = df.groupby("Stock")["Close"].shift(-LABEL_HORIZON)
+    df["_fwd_ret"]   = (df["_fwd_close"] - df["Close"]) / df["Close"].replace(0, np.nan)
+
+    # 3-class label: 1=UP, 0=FLAT, -1=DOWN
+    df["label"] = np.where(
+        df["_fwd_ret"] >  UP_THRESH,    1,
+        np.where(df["_fwd_ret"] < DOWN_THRESH, -1, 0)
+    )
+    # Rows where forward return is NaN (last LABEL_HORIZON rows per stock)
+    df.loc[df["_fwd_ret"].isna(), "label"] = np.nan
+    df = df.dropna(subset=["label"]).copy()
+    df["label"] = df["label"].astype(int)
+
+    valid = len(df)
+    up    = int((df["label"] ==  1).sum())
+    flat  = int((df["label"] ==  0).sum())
+    down  = int((df["label"] == -1).sum())
+    log.info(f"Labels: total={valid}  UP={up} ({up/valid*100:.1f}%)  "
+             f"FLAT={flat} ({flat/valid*100:.1f}%)  "
+             f"DOWN={down} ({down/valid*100:.1f}%)")
+
+    # ── 8. Clean up temp / leakage columns ───────────────────────────────────
+    drop_cols = [
+        "_fwd_close", "_fwd_ret",
+        "Direction", "Year", "Sector",
+    ]
+    df = df.drop(columns=[c for c in drop_cols if c in df.columns])
+
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    str_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
+    df[num_cols] = df[num_cols].fillna(0)
+    df[str_cols] = df[str_cols].fillna("")
+
+    # ── 9. Feature validation ─────────────────────────────────────────────────
+    meta_cols = ["Date", "Stock", "label"]
+    raw_price  = ["Open", "High", "Low", "Close", "Volume"]
+    feature_candidates = [c for c in df.columns
+                          if c not in meta_cols and c not in raw_price]
+    feature_candidates = _remove_constant_cols(df, feature_candidates)
+    log.info(f"Final feature count (excl. meta/raw-price): {len(feature_candidates)}")
+
+    mandatory = [
+        "RSI", "MACD_hist", "MACD_signal", "EMA_20", "ATR", "OBV",
+        "momentum_5d", "momentum_10d", "momentum_diff", "momentum_strength",
+        "volatility_ratio", "hist_vol_20d",
+        "bb_width", "bb_pct", "atr_norm_range",
+        "vol_spike", "vol_breakout", "price_pos_20d",
+        "news_score", "news_rolling_3d", "news_decay", "has_news",
+        "event_strength", "event_impact_decay", "event_score_max", "is_event",
+        "PE_Ratio", "ROE", "Revenue_Growth", "Profit_Growth",
+        "alpha_strength",
+        "nifty_ret_1d", "nifty_ret_5d",
+        "ret_vs_nifty_1d", "ret_vs_nifty_5d",
+        "sector_ret_1d", "sector_ret_5d", "return_vs_sector",
+        "sector_rel_momentum", "sector_encoded",
+    ]
+    missing = [f for f in mandatory if f not in df.columns]
+    if missing:
+        raise RuntimeError(f"Mandatory features missing from merged df: {missing}")
+    log.info("All mandatory features present ✓")
+
+    # ── 10. Save ──────────────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(MERGED_CSV), exist_ok=True)
-    merged.to_csv(MERGED_CSV, index=False)
+    df.to_csv(MERGED_CSV, index=False)
 
-    print(f"\n[OK] Saved: {MERGED_CSV}")
-    print(f"Shape: {merged.shape} | Columns: {len(merged.columns)}")
-    print(f"Date range: {merged['Date'].min()} → {merged['Date'].max()}")
-    pre2020 = (merged["Date"] < "2020-01-01").sum()
-    print(f"Pre-2020 rows: {pre2020}  (should be 0)")
-
-    alpha_valid = merged["alpha_5d"].notna().sum()
-    pos  = (merged["alpha_5d"] > ALPHA_THRESH).sum()
-    neg  = (merged["alpha_5d"] < -ALPHA_THRESH).sum()
-    print(f"\n  Alpha label (threshold={ALPHA_THRESH}) → total={alpha_valid}  UP={pos}  DOWN={neg}")
-    if (pos + neg) > 0:
-        print(f"  Balance: UP%={pos/(pos+neg)*100:.1f}%")
-
-    # Feature presence check
-    print("\n  FEATURES list presence check:")
-    for f in FEATURES:
-        status = "✓" if f in merged.columns else "✗ MISSING"
-        print(f"    {f:30s} {status}")
-
-    # Step 8 — M&M validation
-    mm = merged[merged["Stock"] == "M&M"]
-    print(f"\n  === M&M Validation ===")
-    print(f"    Rows:                  {len(mm)}")
-    if "news_score" in mm.columns:
-        nz = (mm["news_score"] != 0).sum()
-        mn = mm["news_score"].mean()
-        print(f"    news_score != 0:       {nz}  (mean={mn:.4f})")
-    else:
-        print(f"    news_score:            MISSING")
-    if "is_event" in mm.columns:
-        print(f"    event rows:            {mm['is_event'].sum()}")
-    else:
-        print(f"    is_event:              MISSING")
-    if "ROE" in mm.columns:
-        print(f"    ROE non-null:          {mm['ROE'].notna().sum()}")
-    if "PE_Ratio" in mm.columns:
-        print(f"    PE_Ratio non-null:     {mm['PE_Ratio'].notna().sum()}")
-    if "momentum_strength" in mm.columns:
-        print(f"    momentum_strength OK:  ✓")
-    if "volatility_ratio" in mm.columns:
-        print(f"    volatility_ratio OK:   ✓")
+    print(f"\n[OK] Saved: {MERGED_CSV}  shape={df.shape}")
+    print(f"     Date range: {df['Date'].min()} -> {df['Date'].max()}")
+    print(f"     Stocks: {df['Stock'].nunique()}")
+    print(f"     Labels  UP={up}  FLAT={flat}  DOWN={down}")
 
 
 if __name__ == "__main__":

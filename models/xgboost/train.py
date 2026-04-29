@@ -1,310 +1,262 @@
-# =============================================================================
-# models/xgboost/train.py  (FIXED v13)
-#
-# FIXES vs v12:
-#   FIX 1: REMOVED CalibratedClassifierCV (crashed with cv="prefit")
-#   FIX 2: Stronger XGBClassifier params — deeper trees, less regularization
-#   FIX 3: Alpha threshold raised to 0.015 (matches merge_features v13)
-#   FIX 4: FEATURES pruned to strong set (imported from merge_features)
-#   FIX 5: Output raw XGBoost probabilities — no calibration wrapper
-# =============================================================================
+"""
+models/xgboost/train.py
+=======================
+XGBoost base model – configured for 3-class classification (UP / FLAT / DOWN).
+
+Changes vs. original:
+  • objective = 'multi:softprob', num_class = 3
+  • Label remapping: model trains on {0,1,2} internally; external labels remain
+    {-1, 0, 1} and are mapped back for evaluation and saving.
+  • CalibratedClassifierCV wrapped around the multi-class base.
+  • Metrics: macro-averaged accuracy, per-class precision/recall/F1,
+    and macro OVR AUC (sklearn roc_auc_score with multi_class='ovr').
+  • scale_pos_weight replaced by sample_weight vector (correct for multi-class).
+"""
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+import logging
 import pickle
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
-                              classification_report, confusion_matrix)
 
-from config.settings import (MERGED_CSV, XGB_MODEL_PATH, XGB_RESULTS_PATH,
-                              RANDOM_SEED)
+from xgboost import XGBClassifier
+from sklearn.calibration import CalibratedClassifierCV
+try:
+    from sklearn.frozen import FrozenEstimator
+    _HAS_FROZEN = True
+except ImportError:
+    _HAS_FROZEN = False
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score,
+    classification_report,
+)
 
+from config.settings import (
+    MERGED_CSV, XGB_MODEL_PATH, XGBOOST_PARAMS, XGBOOST_FEATURES,
+    TRAIN_END, VAL_START, VAL_END, TEST_START, RANDOM_SEED,
+    XGB_RESULTS_PATH,
+)
 
-def _p(tag, msg):
-    print(f"  [{tag}] {msg}", flush=True)
+logging.basicConfig(level=logging.INFO, format="  [%(levelname)s] %(message)s")
+log = logging.getLogger("xgb_train")
 
+# ── Label encoding ────────────────────────────────────────────────────────────
+# XGBoost multi:softprob requires contiguous integer labels starting at 0.
+# External label space: {-1: DOWN, 0: FLAT, 1: UP}
+# Internal label space: { 0: DOWN,  1: FLAT, 2: UP }
 
-# ---------------------------------------------------------------------------
-# FEATURE LIST (strong set — matches merge_features v13 FEATURES)
-# ---------------------------------------------------------------------------
-
-FEATURES = [
-    "RSI", "MACD_hist", "EMA_20", "ATR", "OBV",
-    "news_score", "news_rolling_3d",
-    "event_score_max", "is_event",
-    "ret_vs_nifty_1d", "ret_vs_nifty_5d",
-    "ret_vs_sector_1d", "ret_vs_sector_5d",
-    "alpha_strength",
-    "vol_spike", "vol_breakout",
-    "momentum_diff", "price_pos_20d",
-    "PE_Ratio", "ROE",
-    "momentum_strength",
-    "volatility_ratio",
-]
-
-# FIX 3: Stronger alpha threshold
-ALPHA_THRESH = 0.015
-THRESHOLD    = 0.52
-
-# Splits
-TRAIN_END  = "2023-12-31"
-VAL_START  = "2024-01-01"
-VAL_END    = "2024-12-31"
-TEST_START = "2025-01-01"
+EXT_TO_INT = {-1: 0, 0: 1, 1: 2}
+INT_TO_EXT = {0: -1, 1: 0, 2: 1}
+CLASS_NAMES = ["DOWN", "FLAT", "UP"]
+NUM_CLASS   = 3
 
 
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
+def encode_labels(y_ext):
+    return np.vectorize(EXT_TO_INT.get)(y_ext)
 
-def _get_X(df, feature_names, train_medians):
-    X = pd.DataFrame(index=df.index)
-    for col in feature_names:
-        if col in df.columns:
-            X[col] = df[col]
-        else:
-            X[col] = train_medians.get(col, 0.0)
-    X = X.apply(pd.to_numeric, errors="coerce")
+
+def decode_labels(y_int):
+    return np.vectorize(INT_TO_EXT.get)(y_int)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def load_data():
+    if not os.path.exists(MERGED_CSV):
+        raise FileNotFoundError(
+            f"Missing {MERGED_CSV}. Run features/merge_features.py first.")
+    df = pd.read_csv(MERGED_CSV, parse_dates=["Date"])
+    return df.sort_values(["Stock", "Date"]).reset_index(drop=True)
+
+
+def time_split(df):
+    train = df[df["Date"] <= TRAIN_END].copy()
+    val   = df[(df["Date"] >= VAL_START) & (df["Date"] <= VAL_END)].copy()
+    test  = df[df["Date"] >= TEST_START].copy()
+    return train, val, test
+
+
+def select_features(df):
+    # Add new features introduced in the updated merge_features.py
+    extra = ["hist_vol_20d", "bb_width", "bb_pct", "atr_norm_range",
+             "sector_rel_momentum"]
+    all_feats = list(dict.fromkeys(XGBOOST_FEATURES + extra))  # preserve order, dedupe
+    available = [c for c in all_feats if c in df.columns]
+    missing   = [c for c in all_feats if c not in df.columns]
+    if missing:
+        log.warning(f"Skipping {len(missing)} missing features: {missing}")
+    return available
+
+
+def prepare_xy(df, feature_cols):
+    if "label" not in df.columns:
+        raise KeyError("Column 'label' missing — re-run merge_features.py")
+    X = df[feature_cols].apply(pd.to_numeric, errors="coerce")
     X.replace([np.inf, -np.inf], np.nan, inplace=True)
-    X = X.fillna(pd.Series(train_medians))
-    return X
+    y_ext = df["label"].astype(int).values
+    y_int = encode_labels(y_ext)
+    return X, y_ext, y_int
 
 
-def _evaluate(y_true, y_proba, split_name):
-    y_pred = (y_proba[:, 1] >= THRESHOLD).astype(int)
-    acc  = accuracy_score(y_true, y_pred)
-    wf1  = f1_score(y_true, y_pred, average="weighted", zero_division=0)
-    mf1  = f1_score(y_true, y_pred, average="macro",    zero_division=0)
-    auc  = roc_auc_score(y_true, y_proba[:, 1])
-    return {"split": split_name, "accuracy": acc,
-            "weighted_f1": wf1, "macro_f1": mf1, "auc_roc": auc}
+def class_weights_as_sample_weight(y_int, num_class=NUM_CLASS):
+    """Per-sample weight inversely proportional to class frequency."""
+    counts  = np.bincount(y_int, minlength=num_class).astype(float)
+    weights = len(y_int) / (num_class * np.maximum(counts, 1))
+    return weights[y_int]
 
 
-def _confidence_eval(y_true, y_proba, threshold=0.6):
-    mask = (y_proba[:, 1] > threshold) | (y_proba[:, 1] < (1 - threshold))
-    if mask.sum() < 50:
-        return None
-    y_pred = (y_proba[mask, 1] >= 0.5).astype(int)
-    return {
-        "n":        int(mask.sum()),
-        "pct":      float(mask.mean()),
-        "accuracy": accuracy_score(y_true[mask], y_pred),
-        "auc":      roc_auc_score(y_true[mask], y_proba[mask, 1]),
-    }
+def print_block(name, y_true_ext, y_pred_ext, y_prob):
+    if len(y_true_ext) == 0:
+        print(f"\n=== {name} === (EMPTY SPLIT)")
+        return
+    acc = accuracy_score(y_true_ext, y_pred_ext)
+    try:
+        auc = roc_auc_score(
+            y_true_ext, y_prob, multi_class="ovr",
+            labels=[-1, 0, 1], average="macro"
+        ) if len(np.unique(y_true_ext)) > 1 else float("nan")
+    except Exception:
+        auc = float("nan")
+
+    print(f"\n{'='*18} {name} {'='*18}")
+    print(f"Samples : {len(y_true_ext)}")
+    print(f"Accuracy: {acc:.4f}   Macro-OVR AUC: {auc:.4f}")
+    print(classification_report(
+        y_true_ext, y_pred_ext,
+        labels=[-1, 0, 1], target_names=CLASS_NAMES,
+        digits=3, zero_division=0
+    ))
 
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-def train():
-    np.random.seed(RANDOM_SEED)
-
+def main():
     print("\n" + "=" * 60)
-    print("  XGBOOST — FIXED v13 (no calibration, strong params)")
+    print("  XGBOOST TRAIN  (3-class: DOWN / FLAT / UP)")
     print("=" * 60)
 
+    df = load_data()
+    log.info(f"Loaded merged data: {df.shape}")
+
+    train_df, val_df, test_df = time_split(df)
+    log.info(f"Splits  train={len(train_df)}  val={len(val_df)}  test={len(test_df)}")
+    if len(train_df) == 0 or len(val_df) == 0 or len(test_df) == 0:
+        raise RuntimeError("One of the splits is empty. Check date ranges in settings.")
+
+    feature_cols = select_features(train_df)
+    log.info(f"Features used: {len(feature_cols)}")
+
+    X_train, y_train_ext, y_train_int = prepare_xy(train_df, feature_cols)
+    X_val,   y_val_ext,   y_val_int   = prepare_xy(val_df,   feature_cols)
+    X_test,  y_test_ext,  y_test_int  = prepare_xy(test_df,  feature_cols)
+
+    train_medians = X_train.median(numeric_only=True).to_dict()
+    X_train = X_train.fillna(pd.Series(train_medians))
+    X_val   = X_val.fillna(pd.Series(train_medians))
+    X_test  = X_test.fillna(pd.Series(train_medians))
+
+    nunique    = X_train.nunique()
+    const_cols = nunique[nunique <= 1].index.tolist()
+    if const_cols:
+        log.warning(f"Dropping constant cols: {const_cols}")
+        X_train = X_train.drop(columns=const_cols)
+        X_val   = X_val.drop(columns=const_cols)
+        X_test  = X_test.drop(columns=const_cols)
+
+    sample_weights = class_weights_as_sample_weight(y_train_int)
+    log.info(f"Class counts (int)  0={int((y_train_int==0).sum())}  "
+             f"1={int((y_train_int==1).sum())}  2={int((y_train_int==2).sum())}")
+
+    # Build multi-class XGBoost params (override binary-specific keys)
+    xgb_params = {k: v for k, v in XGBOOST_PARAMS.items()
+                  if k not in ("scale_pos_weight",)}
+    xgb_params.update({
+        "objective":   "multi:softprob",
+        "num_class":   NUM_CLASS,
+        "eval_metric": "mlogloss",
+        "use_label_encoder": False,
+    })
+
+    base = XGBClassifier(**xgb_params, early_stopping_rounds=30)
+
+    log.info("Training base XGBoost (multi:softprob, early stopping on val) ...")
+    base.fit(
+        X_train, y_train_int,
+        sample_weight=sample_weights,
+        eval_set=[(X_val, y_val_int)],
+        verbose=False,
+    )
+    best_iter = getattr(base, "best_iteration", None)
+    if best_iter is not None:
+        log.info(f"Best iteration: {best_iter}")
+
+    log.info("Calibrating probabilities (sigmoid) on validation set ...")
+    if _HAS_FROZEN:
+        calibrator = CalibratedClassifierCV(
+            FrozenEstimator(base), method="sigmoid", cv=None
+        )
+    else:
+        calibrator = CalibratedClassifierCV(
+            estimator=base, method="sigmoid", cv="prefit"
+        )
+    calibrator.fit(X_val, y_val_int)
+
+    # predict_proba → shape (N, 3): columns = [P(DOWN), P(FLAT), P(UP)]
+    prob_train = calibrator.predict_proba(X_train)   # (N, 3)
+    prob_val   = calibrator.predict_proba(X_val)
+    prob_test  = calibrator.predict_proba(X_test)
+
+    pred_train_int = prob_train.argmax(axis=1)
+    pred_val_int   = prob_val.argmax(axis=1)
+    pred_test_int  = prob_test.argmax(axis=1)
+
+    pred_train_ext = decode_labels(pred_train_int)
+    pred_val_ext   = decode_labels(pred_val_int)
+    pred_test_ext  = decode_labels(pred_test_int)
+
+    print_block("TRAIN",      y_train_ext, pred_train_ext, prob_train)
+    print_block("VALIDATION", y_val_ext,   pred_val_ext,   prob_val)
+    print_block("TEST",       y_test_ext,  pred_test_ext,  prob_test)
+
     try:
-        from xgboost import XGBClassifier
-    except ImportError:
-        _p("x", "xgboost not installed. Run: pip install xgboost")
-        return {}
+        importances = base.feature_importances_
+        fi = sorted(zip(X_train.columns, importances),
+                    key=lambda x: x[1], reverse=True)[:15]
+        print("\nTop-15 Features (by gain):")
+        for f, v in fi:
+            print(f"  {f:35s} {v:.4f}")
+    except Exception as e:
+        log.warning(f"Could not compute feature importances: {e}")
 
-    if not os.path.exists(MERGED_CSV):
-        _p("x", "merged_final.csv not found. Run merge_features.py first.")
-        return {}
-
-    df = pd.read_csv(MERGED_CSV)
-    _p("OK", f"Loaded merged_final.csv  shape={df.shape}")
-
-    dates = pd.to_datetime(df["Date"])
-    _p("i", f"Date range: {dates.min().date()} → {dates.max().date()}")
-    pre_2020 = (dates < "2020-01-01").sum()
-    if pre_2020 > 0:
-        _p("!", f"WARNING: {pre_2020} rows before 2020-01-01. Re-run merge_features.py v13.")
-
-    # ── 1. Alpha-based label (FIX 3: threshold=0.015) ──────────────────────
-    if "alpha_5d" not in df.columns:
-        _p("x", "Column 'alpha_5d' missing. Re-run merge_features.py v13.")
-        return {}
-
-    df = df.sort_values(["Stock", "Date"]).reset_index(drop=True)
-    before = len(df)
-    df = df[df["alpha_5d"].notna()].copy()
-    df = df[df["alpha_5d"].abs() >= ALPHA_THRESH].copy()
-    after = len(df)
-    _p("OK", f"Alpha filter (|alpha_5d| > {ALPHA_THRESH*100:.1f}%): "
-              f"{before} → {after} rows  ({(before-after)/before*100:.1f}% dropped)")
-
-    df["label"] = (df["alpha_5d"] > 0).astype(int)
-    n_up   = (df["label"] == 1).sum()
-    n_down = (df["label"] == 0).sum()
-    _p("OK", f"Label distribution: UP={n_up}  DOWN={n_down}  "
-              f"UP%={n_up/(n_up+n_down)*100:.1f}%")
-
-    # ── 2. Time-based split ─────────────────────────────────────────────────
-    df["Date"] = df["Date"].astype(str)
-    train_df = df[df["Date"] <= TRAIN_END].copy()
-    val_df   = df[(df["Date"] >= VAL_START) & (df["Date"] <= VAL_END)].copy()
-    test_df  = df[df["Date"] >= TEST_START].copy()
-
-    _p("OK", f"Train: {len(train_df)} rows  ({train_df['Date'].min()} → {TRAIN_END})")
-    _p("OK", f"Val:   {len(val_df)} rows   ({VAL_START} → {VAL_END})")
-    _p("OK", f"Test:  {len(test_df)} rows  ({TEST_START} →)")
-
-    for split_name, split_df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
-        if len(split_df) < 200:
-            _p("!", f"WARNING: {split_name} set has only {len(split_df)} rows after alpha filter.")
-
-    # ── 3. Feature matrix ───────────────────────────────────────────────────
-    feat_used = [f for f in FEATURES if f in df.columns]
-    missing   = [f for f in FEATURES if f not in df.columns]
-    if missing:
-        _p("!", f"Features missing from CSV ({len(missing)}): {missing}")
-    _p("i", f"Using {len(feat_used)} features")
-
-    # Train-only medians (no leakage)
-    train_medians = train_df[feat_used].apply(pd.to_numeric, errors="coerce").median().to_dict()
-
-    X_train = _get_X(train_df, feat_used, train_medians)
-    X_val   = _get_X(val_df,   feat_used, train_medians)
-    X_test  = _get_X(test_df,  feat_used, train_medians)
-
-    y_train = train_df["label"].values
-    y_val   = val_df["label"].values
-    y_test  = test_df["label"].values
-
-    # ── 4. Class balance ─────────────────────────────────────────────────────
-    n_tr_up   = (y_train == 1).sum()
-    n_tr_down = (y_train == 0).sum()
-    spw = n_tr_down / max(n_tr_up, 1)
-    _p("i", f"scale_pos_weight={spw:.3f} (train: UP={n_tr_up}, DOWN={n_tr_down})")
-
-    # ── 5. Train XGBoost (FIX 1+2: no calibration, stronger params) ─────────
-    # FIX 2: Params from spec — deeper trees, lower regularization
-    model = XGBClassifier(
-        n_estimators=800,
-        max_depth=8,
-        learning_rate=0.03,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        min_child_weight=3,
-        gamma=0.1,
-        reg_lambda=1.0,
-        reg_alpha=0.1,
-        eval_metric="logloss",
-        scale_pos_weight=spw,
-        random_state=RANDOM_SEED,
-        n_jobs=-1,
-        tree_method="hist",
-    )
-
-    _p("i", f"Training XGBoost: {len(feat_used)} features, {len(X_train)} rows ...")
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
-        early_stopping_rounds=50,
-        verbose=50,
-    )
-    _p("i", f"Best iteration: {model.best_iteration}  "
-             f"Best val_logloss: {model.best_score:.5f}")
-
-    if model.best_iteration == 0:
-        _p("!", "WARNING: best_iteration=0 — model did not improve. Check features/data.")
-
-    # ── 6. Predictions (FIX 1+5: raw probabilities, NO calibration wrapper) ──
-    y_proba_train = model.predict_proba(X_train)
-    y_proba_val   = model.predict_proba(X_val)
-    y_proba_test  = model.predict_proba(X_test)
-
-    # ── 7. Evaluation ─────────────────────────────────────────────────────────
-    results_list = []
-    for split, yt, yp in [("Train", y_train, y_proba_train),
-                            ("Val",   y_val,   y_proba_val),
-                            ("Test",  y_test,  y_proba_test)]:
-        r = _evaluate(yt, yp, split)
-        results_list.append(r)
-
-    print("\n" + "=" * 68)
-    print("  XGBOOST v13 — EVALUATION SUMMARY")
-    print("=" * 68)
-    print(f"  {'Metric':<14} | {'Train':>10} | {'Val':>10} | {'Test':>10}")
-    print(f"  {'-'*14}+{'-'*12}+{'-'*12}+{'-'*12}")
-    for metric in ["accuracy", "weighted_f1", "macro_f1", "auc_roc"]:
-        vals = [f"{r[metric]:.4f}" for r in results_list]
-        print(f"  {metric.replace('_',' ').title():<14} | {vals[0]:>10} | {vals[1]:>10} | {vals[2]:>10}")
-    print("=" * 68)
-
-    y_pred_test = (y_proba_test[:, 1] >= THRESHOLD).astype(int)
-    print(f"\n  [ Test Set Report — threshold={THRESHOLD} ]")
-    print(classification_report(y_test, y_pred_test,
-                                 target_names=["DOWN", "UP"], digits=3))
-    print("  Confusion Matrix (rows=actual DOWN/UP, cols=predicted DOWN/UP):")
-    cm = confusion_matrix(y_test, y_pred_test)
-    print(f"    {cm}")
-
-    test_probs = y_proba_test[:, 1]
-    _p("i", f"Prob spread — mean={test_probs.mean():.4f}  "
-             f"std={test_probs.std():.4f}  "
-             f"min={test_probs.min():.4f}  "
-             f"max={test_probs.max():.4f}")
-    if test_probs.std() < 0.02:
-        _p("!", "WARNING: std < 0.02 — model may be collapsing to one class.")
-
-    conf = _confidence_eval(y_test, y_proba_test, threshold=0.6)
-    if conf:
-        print(f"\n  [ High-Confidence Predictions (prob > 0.6 or < 0.4) ]")
-        print(f"    Rows:     {conf['n']} ({conf['pct']*100:.1f}% of test)")
-        print(f"    Accuracy: {conf['accuracy']:.4f}")
-        print(f"    AUC-ROC:  {conf['auc']:.4f}")
-
-    baseline_acc = float(y_test.mean())
-    _p("i", f"Always-UP baseline on test: {baseline_acc:.4f}")
-    _p("i", f"Model improvement over baseline: {results_list[2]['accuracy'] - baseline_acc:+.4f}")
-
-    importances = pd.Series(model.feature_importances_, index=feat_used)
-    top20 = importances.nlargest(20)
-    print("\n  Top-20 feature importances:")
-    for feat, imp in top20.items():
-        print(f"    {feat:35s}  {imp:.4f}")
-
-    # ── 8. Save (FIX 5: save raw model, not calibrated wrapper) ──────────────
     payload = {
-        "model"          : model,           # raw XGBClassifier
-        "feature_names"  : feat_used,
-        "train_medians"  : train_medians,
-        "threshold"      : THRESHOLD,
-        "label_type"     : "alpha_5d",
-        "alpha_threshold": ALPHA_THRESH,
-        "split": {
-            "train_end" : TRAIN_END,
-            "val_start" : VAL_START,
-            "val_end"   : VAL_END,
-            "test_start": TEST_START,
-        },
-        # expose val probabilities for ensemble stacking
-        "val_proba": y_proba_val,
-        "val_labels": y_val,
+        "model":         calibrator,
+        "base_model":    base,
+        "feature_names": list(X_train.columns),
+        "train_medians": {c: float(train_medians.get(c, 0.0))
+                          for c in X_train.columns},
+        "ext_to_int":    EXT_TO_INT,
+        "int_to_ext":    INT_TO_EXT,
+        "num_class":     NUM_CLASS,
+        # predict_proba columns: [P(DOWN), P(FLAT), P(UP)]
+        "proba_cols":    ["prob_down", "prob_flat", "prob_up"],
     }
     os.makedirs(os.path.dirname(XGB_MODEL_PATH), exist_ok=True)
     with open(XGB_MODEL_PATH, "wb") as f:
         pickle.dump(payload, f)
-    _p("OK", f"Model saved → {XGB_MODEL_PATH}")
+    log.info(f"Model saved -> {XGB_MODEL_PATH}")
 
-    # ── 9. Save results ────────────────────────────────────────────────────────
-    res = test_df[["Date", "Stock"]].copy()
-    res["label"]    = y_test
-    res["pred"]     = y_pred_test
-    res["prob_up"]  = y_proba_test[:, 1]
-    res["alpha_5d"] = test_df["alpha_5d"].values
+    res = test_df[["Date", "Stock", "label"]].copy().reset_index(drop=True)
+    res["Predicted"]  = pred_test_ext
+    res["prob_down"]  = prob_test[:, 0]
+    res["prob_flat"]  = prob_test[:, 1]
+    res["prob_up"]    = prob_test[:, 2]
+    res["Confidence"] = prob_test.max(axis=1)
     os.makedirs(os.path.dirname(XGB_RESULTS_PATH), exist_ok=True)
     res.to_csv(XGB_RESULTS_PATH, index=False)
-    _p("OK", f"Results saved → {XGB_RESULTS_PATH}")
-
-    return payload
+    log.info(f"Test results -> {XGB_RESULTS_PATH}")
 
 
 if __name__ == "__main__":
-    train()
+    main()
