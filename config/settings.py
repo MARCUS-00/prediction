@@ -35,9 +35,17 @@ RANDOM_SEED     = 42
 TRAIN_RATIO     = 0.70
 VAL_RATIO       = 0.15
 
-LABEL_MAP        = {-1: 0, 1: 1}
-LABEL_MAP_INV    = {0: "DOWN", 1: "UP"}
-DIRECTION_LABELS = ["DOWN", "UP"]
+# ── 3-class label maps ────────────────────────────────────────────────────────
+# External label space : {-1: DOWN, 0: FLAT,  1: UP}
+# Internal label space : { 0: DOWN, 1: FLAT,  2: UP}  (used by XGB / LSTM)
+# LABEL_MAP_INV maps INTERNAL → human string (matches internal index)
+LABEL_MAP        = {-1: 0, 1: 2}           # kept for legacy callers; prefer EXT_TO_INT
+LABEL_MAP_INV    = {0: "DOWN", 1: "FLAT", 2: "UP"}   # internal {0,1,2} → string
+DIRECTION_LABELS = ["DOWN", "FLAT", "UP"]
+
+# External → Internal and back (canonical; used by train.py, predict.py, etc.)
+EXT_TO_INT = {-1: 0, 0: 1, 1: 2}
+INT_TO_EXT = {0: -1, 1: 0, 2: 1}
 
 SECTOR_MAP = {
     "HDFCBANK":   "Financial_Services", "ICICIBANK":  "Financial_Services",
@@ -112,8 +120,9 @@ LSTM_FEATURES = [
     "event_strength",
 ]
 
+# ── LSTM hyper-parameters (single source of truth) ───────────────────────────
 LSTM_HIDDEN   = 64
-LSTM_LAYERS   = 1
+LSTM_LAYERS   = 1      # <── authoritative; predict.py must read this
 LSTM_DROPOUT  = 0.3
 LSTM_EPOCHS   = 60
 LSTM_BATCH    = 256
