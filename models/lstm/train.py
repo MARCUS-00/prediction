@@ -193,10 +193,11 @@ def train():
     log.info(f"Params: {n_params:,}  device={device}  "
              f"hidden={LSTM_HIDDEN}  layers={LSTM_LAYERS}")
 
-    opt   = Adam(net.parameters(), lr=LSTM_LR, weight_decay=1e-4)
+    # --- FIX: Removed weight_decay and label_smoothing ---
+    opt   = Adam(net.parameters(), lr=LSTM_LR)
     sched = ReduceLROnPlateau(opt, mode="min",
                               patience=max(5, LSTM_PATIENCE // 3), factor=0.5)
-    crit  = nn.CrossEntropyLoss(weight=weights.to(device), label_smoothing=0.05)
+    crit  = nn.CrossEntropyLoss(weight=weights.to(device))
 
     best_loss, best_state, patience_cnt = float("inf"), None, 0
 

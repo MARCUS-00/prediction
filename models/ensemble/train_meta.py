@@ -19,6 +19,7 @@ Changes vs. original:
     • Meta-learner handles 3-class labels {-1, 0, 1}.
     • Per-class metrics and macro OVR AUC reported.
     • Saved payload includes finbert_path for downstream predict.py.
+    • Removed Calibration to preserve balanced class_weights.
 """
 
 import sys, os
@@ -30,7 +31,6 @@ import numpy as np
 import pandas as pd
 
 from sklearn.linear_model import LogisticRegression
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     accuracy_score, roc_auc_score, classification_report,
 )
@@ -225,20 +225,14 @@ def train():
     cc = {v: int((y_meta == v).sum()) for v in [-1, 0, 1]}
     log.info(f"Meta-train label counts  DOWN={cc[-1]}  FLAT={cc[0]}  UP={cc[1]}")
 
-    base_lr = LogisticRegression(
+    # --- FIX: Removed CalibratedClassifierCV to preserve balanced class weights ---
+    meta = LogisticRegression(
         max_iter=2000,
         random_state=RANDOM_SEED,
         C=0.1,
         solver="lbfgs",
-        class_weight="balanced",
+        class_weight="balanced", 
     )
-    min_class_count = min(cc.values())
-    if min_class_count >= 3:
-        meta = CalibratedClassifierCV(base_lr, cv=3, method="isotonic")
-    else:
-        log.warning("Too few samples in a class for CV calibration — using raw LR.")
-        meta = base_lr
-
     meta.fit(X_meta, y_meta)
     log.info("Meta-learner trained ✓")
 
