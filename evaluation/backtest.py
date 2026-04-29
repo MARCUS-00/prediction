@@ -1,3 +1,13 @@
+"""
+evaluation/backtest.py
+======================
+BUGS FIXED:
+  BUG-6  pred_str mapped using LABEL_MAP_INV which maps internal {0,1,2}.
+         If Predicted column holds external {-1,0,1}, that mapping is wrong.
+         Fixed: detect whether values are internal or external and map correctly.
+         Also fixed: strat_ret now captures both UP and short-sells DOWN signals.
+"""
+
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -6,6 +16,28 @@ import pandas as pd
 
 from config.settings import LABEL_MAP_INV
 
+# String direction → position multiplier (1=long, -1=short, 0=flat)
+_DIR_TO_POS = {"UP": 1.0, "DOWN": -1.0, "FLAT": 0.0}
+
+
+def _to_direction_str(series: pd.Series) -> pd.Series:
+    """
+    Convert a Predicted column (internal int 0/1/2 OR external int -1/0/1
+    OR string 'UP'/'FLAT'/'DOWN') → string direction.
+    """
+    if pd.api.types.is_object_dtype(series):
+        # Already strings
+        return series.astype(str)
+
+    vals = series.dropna().unique().tolist()
+    if any(v in (-1,) for v in vals):
+        # External space {-1, 0, 1}
+        ext_to_str = {-1: "DOWN", 0: "FLAT", 1: "UP"}
+        return series.astype(int).map(ext_to_str)
+    else:
+        # Internal space {0, 1, 2}
+        return series.astype(int).map(LABEL_MAP_INV)
+
 
 def run_backtest(test_df, pred_col="Predicted",
                  label_col="label", ret_col="Return_1d") -> dict:
@@ -13,16 +45,15 @@ def run_backtest(test_df, pred_col="Predicted",
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values(["Date", "Stock"])
 
-    if pd.api.types.is_numeric_dtype(df[pred_col]):
-        df["pred_str"] = df[pred_col].astype(int).map(LABEL_MAP_INV)
-    else:
-        df["pred_str"] = df[pred_col].astype(str)
+    df["pred_str"] = _to_direction_str(df[pred_col])
 
     if ret_col not in df.columns:
         raise KeyError(f"Return column '{ret_col}' not in dataframe")
 
-    df["strat_ret"] = np.where(df["pred_str"] == "UP", df[ret_col].fillna(0), 0.0)
-    df["bh_ret"]    = df[ret_col].fillna(0)
+    # FIX: long on UP, short on DOWN, flat on FLAT
+    df["position"]  = df["pred_str"].map(_DIR_TO_POS).fillna(0.0)
+    df["strat_ret"] = df["position"] * df[ret_col].fillna(0.0)
+    df["bh_ret"]    = df[ret_col].fillna(0.0)
 
     daily = df.groupby("Date")[["strat_ret", "bh_ret"]].mean()
     daily["strat_cum"] = (1 + daily["strat_ret"]).cumprod()
@@ -40,8 +71,9 @@ def run_backtest(test_df, pred_col="Predicted",
     max_dd    = float(((daily["strat_cum"] - cummax) / cummax.replace(0, np.nan)).min())
     if np.isnan(max_dd):
         max_dd = 0.0
-    active    = df[df["pred_str"] == "UP"]
-    win_rate  = float((active["strat_ret"] > 0).mean()) if len(active) > 0 else 0.0
+
+    active   = df[df["pred_str"] == "UP"]
+    win_rate = float((active["strat_ret"] > 0).mean()) if len(active) > 0 else 0.0
 
     print(f"\n{'-' * 45}")
     print("  BACKTEST RESULTS")
@@ -50,8 +82,9 @@ def run_backtest(test_df, pred_col="Predicted",
     print(f"  Buy & Hold      : {bh_ret * 100:.2f}%")
     print(f"  Sharpe Ratio    : {sharpe:.3f}")
     print(f"  Max Drawdown    : {max_dd * 100:.2f}%")
-    print(f"  Win Rate        : {win_rate * 100:.1f}%")
+    print(f"  Win Rate (UP)   : {win_rate * 100:.1f}%")
     print(f"  UP Trades       : {len(active)}")
+    print(f"  DOWN Trades     : {int((df['pred_str'] == 'DOWN').sum())}")
     print(f"{'-' * 45}\n")
 
     return {"strategy_return": strat_ret, "bh_return": bh_ret, "sharpe": sharpe,

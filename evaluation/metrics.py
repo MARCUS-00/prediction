@@ -1,3 +1,11 @@
+"""
+evaluation/metrics.py
+=====================
+BUGS FIXED:
+  BUG-5  confusion_matrix(labels=[0,1]) silently dropped the DOWN class (-1)
+         in a 3-class problem. Fixed to use labels=[-1,0,1] with named targets.
+"""
+
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -8,7 +16,11 @@ from sklearn.metrics import (
     mean_absolute_error, mean_squared_error,
 )
 
-from config.settings import DIRECTION_LABELS
+from config.settings import DIRECTION_LABELS   # ["DOWN", "FLAT", "UP"]
+
+# 3-class external label space
+_EXT_LABELS  = [-1, 0, 1]
+_CLASS_NAMES = DIRECTION_LABELS  # ["DOWN", "FLAT", "UP"]
 
 
 def evaluate(y_true, y_pred, y_proba=None, model_name="Model", verbose=True) -> dict:
@@ -16,22 +28,30 @@ def evaluate(y_true, y_pred, y_proba=None, model_name="Model", verbose=True) -> 
     y_pred = np.asarray(y_pred)
 
     acc  = accuracy_score(y_true, y_pred)
-    f1_w = f1_score(y_true, y_pred, average="weighted", zero_division=0)
-    f1_m = f1_score(y_true, y_pred, average="macro",    zero_division=0)
-    cm   = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    rep  = classification_report(y_true, y_pred,
-                                 target_names=DIRECTION_LABELS, zero_division=0)
+    f1_w = f1_score(y_true, y_pred, average="weighted", zero_division=0,
+                    labels=_EXT_LABELS)
+    f1_m = f1_score(y_true, y_pred, average="macro",    zero_division=0,
+                    labels=_EXT_LABELS)
+
+    # FIX: use all 3 external labels, not just [0,1]
+    cm  = confusion_matrix(y_true, y_pred, labels=_EXT_LABELS)
+    rep = classification_report(y_true, y_pred,
+                                labels=_EXT_LABELS,
+                                target_names=_CLASS_NAMES,
+                                zero_division=0)
     auc = float("nan")
     if y_proba is not None:
         try:
             y_proba = np.asarray(y_proba)
-            if y_proba.ndim == 2 and y_proba.shape[1] == 2:
+            if y_proba.ndim == 2 and y_proba.shape[1] == 3:
+                auc = roc_auc_score(y_true, y_proba,
+                                    multi_class="ovr",
+                                    labels=_EXT_LABELS,
+                                    average="macro")
+            elif y_proba.ndim == 2 and y_proba.shape[1] == 2:
                 auc = roc_auc_score(y_true, y_proba[:, 1])
             elif y_proba.ndim == 1:
                 auc = roc_auc_score(y_true, y_proba)
-            else:
-                auc = roc_auc_score(y_true, y_proba,
-                                    multi_class="ovr", average="weighted")
         except Exception:
             pass
 
@@ -45,7 +65,7 @@ def evaluate(y_true, y_pred, y_proba=None, model_name="Model", verbose=True) -> 
         if not np.isnan(auc):
             print(f"  AUC-ROC     : {auc:.4f}")
         print(f"\n{rep}")
-        print(f"  Confusion Matrix (DOWN/UP):\n{cm}")
+        print(f"  Confusion Matrix (DOWN / FLAT / UP):\n{cm}")
         print(f"{'-' * 55}\n")
 
     return {"model": model_name, "accuracy": acc, "weighted_f1": f1_w,
@@ -73,20 +93,16 @@ def evaluate_all(y_tr, p_tr, pr_tr,
     print(f"  AUC-ROC      |   {res_tr['auc_roc']:.4f}   |   "
           f"{res_v['auc_roc']:.4f}   |   {res_te['auc_roc']:.4f}")
     print(f"{'=' * 65}\n")
-
-    print(f"  [ Test Set Detailed Report ]")
-    print(f"{res_te['report']}")
-    print(f"  Confusion Matrix (DOWN/UP):")
-    print(f"{res_te['cm']}\n")
-
+    print(f"  [ Test Set Detailed Report ]\n{res_te['report']}")
+    print(f"  Confusion Matrix (DOWN / FLAT / UP):\n{res_te['cm']}\n")
     return res_te
 
 
 def regression_metrics(y_true, y_pred, name="Regression") -> dict:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
-    mae  = mean_absolute_error(y_true, y_pred)
-    mse  = mean_squared_error(y_true, y_pred)
-    rmse = float(np.sqrt(mse))
+    mae    = mean_absolute_error(y_true, y_pred)
+    mse    = mean_squared_error(y_true, y_pred)
+    rmse   = float(np.sqrt(mse))
     print(f"\n  {name} - MAE={mae:.6f}  MSE={mse:.6f}  RMSE={rmse:.6f}")
     return {"mae": mae, "mse": mse, "rmse": rmse}

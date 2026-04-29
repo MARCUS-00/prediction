@@ -1,3 +1,11 @@
+"""
+prediction/recommendation.py
+=============================
+Signal helpers — no logic bugs here, but added FLAT handling explicitly
+and improved expected_movement to use ATR% with direction sign.
+"""
+
+
 def confidence_label(score: float) -> str:
     if score >= 0.85:
         return "Strong Signal"
@@ -7,14 +15,15 @@ def confidence_label(score: float) -> str:
 
 
 def recommendation(direction: str, confidence: float) -> str:
+    """BUY on UP, SELL on DOWN, HOLD on FLAT, OBSERVE when confidence is low."""
     if confidence < 0.70:
         return "OBSERVE"
-    return {"UP": "BUY", "DOWN": "SELL"}.get(direction, "OBSERVE")
+    return {"UP": "BUY", "DOWN": "SELL", "FLAT": "HOLD"}.get(direction, "OBSERVE")
 
 
 def expected_movement(row, direction: str) -> str:
     try:
-        atr   = float(row.get("ATR",  0.0) or 0.0)
+        atr   = float(row.get("ATR",   0.0) or 0.0)
         close = float(row.get("Close", 1.0) or 1.0)
     except (TypeError, ValueError):
         atr, close = 0.0, 1.0

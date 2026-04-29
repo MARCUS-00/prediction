@@ -1,3 +1,18 @@
+"""
+prediction/single_stock.py
+==========================
+Single-stock prediction entry point.
+
+BUGS FIXED:
+  BUG-4  direction = LABEL_MAP_INV[int(latest["Predicted"])]
+         "Predicted" stores internal index {0,1,2}; LABEL_MAP_INV maps
+         {0:DOWN, 1:FLAT, 2:UP} — that part was technically OK, BUT
+         ensemble/predict.py (old) stored the double-mapped value so the
+         index was wrong.  After fixing ensemble/predict.py, this file
+         now reads the correct internal index and the lookup is valid.
+         Added explicit guard + fallback to Direction_Label column.
+"""
+
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,8 +34,7 @@ except Exception:
 from xai.explain_output         import build_bullets, format_output
 from prediction.recommendation  import confidence_label, recommendation, expected_movement
 
-logging.basicConfig(level=logging.INFO,
-                    format="  [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO, format="  [%(levelname)s] %(message)s")
 log = logging.getLogger("predict_single")
 
 
@@ -37,7 +51,7 @@ def predict_single(symbol: str, df: pd.DataFrame = None) -> dict:
     sdf = df[df["Stock"] == symbol].sort_values("Date").reset_index(drop=True)
     if sdf.empty:
         return {"error": f"No data for '{symbol}'. "
-                         f"Check symbol is in merged_final.csv"}
+                         "Check symbol is in merged_final.csv"}
 
     try:
         xgb_p = load_xgb()
@@ -66,10 +80,17 @@ def predict_single(symbol: str, df: pd.DataFrame = None) -> dict:
     if result_df.empty:
         return {"error": f"No predictions produced for {symbol}"}
 
-    latest    = result_df.iloc[-1]
-    direction = LABEL_MAP_INV[int(latest["Predicted"])]
-    conf      = float(latest["Confidence"])
-    bullets   = build_bullets(latest, direction, xgb_p)
+    latest = result_df.iloc[-1]
+
+    # ── FIX: prefer explicit Direction_Label; fall back to LABEL_MAP_INV ──────
+    if "Direction_Label" in latest.index and latest["Direction_Label"]:
+        direction = str(latest["Direction_Label"])
+    else:
+        pred_int  = int(latest.get("Predicted", 1))
+        direction = LABEL_MAP_INV.get(pred_int, "FLAT")
+
+    conf    = float(latest.get("Confidence", 0.0))
+    bullets = build_bullets(latest, direction, xgb_p)
 
     result = {
         "Stock":             symbol,
