@@ -30,7 +30,10 @@ VAL_END    = "2024-12-31"
 TEST_START = "2025-01-01"
 
 LABEL_HORIZON   = 5
-LABEL_THRESHOLD = 0.005
+# FIX 4: Align LABEL_THRESHOLD with the 1.5% threshold actually used in
+#         merge_features.py (UP_THRESH / DOWN_THRESH = ±0.015).
+#         Old value 0.005 was inconsistent; FLAT class was ~43%, now ~30%.
+LABEL_THRESHOLD = 0.015
 RANDOM_SEED     = 42
 TRAIN_RATIO     = 0.70
 VAL_RATIO       = 0.15
@@ -90,6 +93,8 @@ XGBOOST_PARAMS = {
 
 XGBOOST_FEATURES = [
     "Return_1d",
+    # FIX 7: Add lag features — strictly no look-ahead (shift≥1 applied in merge_features)
+    "ret_lag_1d", "ret_lag_3d", "ret_lag_5d",
     "momentum_5d", "momentum_10d", "momentum_diff", "momentum_strength",
     "RSI", "EMA_20",
     "MACD_hist", "MACD_signal",
@@ -101,6 +106,8 @@ XGBOOST_FEATURES = [
     "ret_vs_nifty_1d", "ret_vs_nifty_5d",
     "sector_ret_1d", "sector_ret_5d", "return_vs_sector", "sector_encoded",
     "PE_Ratio", "ROE", "Revenue_Growth", "Profit_Growth",
+    # FIX 3: has_fundamental_data flag so model knows when fundamentals are real vs filled
+    "has_fundamental_data",
     "news_score", "news_rolling_3d", "news_decay", "has_news",
     "event_score_max", "is_event", "event_strength", "event_impact_decay",
     "alpha_strength",
@@ -109,6 +116,8 @@ XGBOOST_FEATURES = [
 SEQUENCE_LENGTH = 15
 LSTM_FEATURES = [
     "Return_1d",
+    # FIX 7: Add lag features to LSTM input
+    "ret_lag_1d", "ret_lag_3d", "ret_lag_5d",
     "momentum_5d", "momentum_10d", "momentum_diff",
     "RSI", "MACD_hist", "MACD_signal",
     "volatility_ratio", "ATR",
@@ -118,11 +127,14 @@ LSTM_FEATURES = [
     "sector_ret_1d", "return_vs_sector",
     "news_score", "news_rolling_3d",
     "event_strength",
+    "has_fundamental_data",
 ]
 
 # ── LSTM hyper-parameters (single source of truth) ───────────────────────────
 LSTM_HIDDEN   = 64
-LSTM_LAYERS   = 1      # <── authoritative; predict.py must read this
+# FIX 6: Set LSTM_LAYERS=2. With 1 layer PyTorch silently ignores the
+#         dropout parameter inside the LSTM cell. 2 layers activates it.
+LSTM_LAYERS   = 2
 LSTM_DROPOUT  = 0.3
 LSTM_EPOCHS   = 60
 LSTM_BATCH    = 256

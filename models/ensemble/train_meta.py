@@ -19,7 +19,6 @@ Changes vs. original:
     • Meta-learner handles 3-class labels {-1, 0, 1}.
     • Per-class metrics and macro OVR AUC reported.
     • Saved payload includes finbert_path for downstream predict.py.
-    • Removed Calibration to preserve balanced class_weights.
 """
 
 import sys, os
@@ -31,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     accuracy_score, roc_auc_score, classification_report,
 )
@@ -225,58 +225,96 @@ def train():
     cc = {v: int((y_meta == v).sum()) for v in [-1, 0, 1]}
     log.info(f"Meta-train label counts  DOWN={cc[-1]}  FLAT={cc[0]}  UP={cc[1]}")
 
-    # --- FIX: Removed CalibratedClassifierCV to preserve balanced class weights ---
-    meta = LogisticRegression(
-        max_iter=2000,
-        random_state=RANDOM_SEED,
-        C=0.1,
-        solver="lbfgs",
-        class_weight="balanced", 
-    )
-    meta.fit(X_meta, y_meta)
-    log.info("Meta-learner trained ✓")
+    # BUG-8 FIX: Replace LogisticRegression with XGBClassifier.
+    # When base model probs have low variance (e.g., XGB always outputs ~0.5,
+    # LSTM outputs ~0.4, FinBERT ~0.33), a linear meta-learner cannot capture
+    # the non-linear interaction patterns between the three base models.
+    # XGBClassifier (shallow, few trees) learns these non-linear combinations
+    # without overfitting on the limited meta-train set.
+    from xgboost import XGBClassifier as XGBMeta
 
-    # ── Evaluation ────────────────────────────────────────────────────────────
-    def _eval(name, y_true, X):
-        probs = meta.predict_proba(X)
-        preds = meta.predict(X)
-        acc   = accuracy_score(y_true, preds)
+    # Label encoding for XGBClassifier: needs {0,1,2} internally
+    _META_EXT_TO_INT = {-1: 0, 0: 1, 1: 2}
+    _META_INT_TO_EXT = {0: -1, 1: 0, 2: 1}
+    y_meta_int = np.vectorize(_META_EXT_TO_INT.get)(y_meta)
+
+    meta_xgb = XGBMeta(
+        objective="multi:softprob",
+        num_class=3,
+        max_depth=3,
+        n_estimators=100,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        use_label_encoder=False,
+        eval_metric="mlogloss",
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+    )
+    meta_xgb.fit(X_meta, y_meta_int)
+
+    # Wrap with calibration for reliable probabilities
+    from sklearn.calibration import CalibratedClassifierCV
+    try:
+        from sklearn.frozen import FrozenEstimator
+        meta = CalibratedClassifierCV(
+            FrozenEstimator(meta_xgb), method="isotonic", cv=None
+        )
+    except ImportError:
+        meta = CalibratedClassifierCV(
+            estimator=meta_xgb, method="isotonic", cv="prefit"
+        )
+    meta.fit(X_meta, y_meta_int)
+    log.info("BUG-8 FIX: XGBClassifier meta-learner trained and calibrated ✓")
+
+    # Evaluation helper — converts internal {0,1,2} predictions back to {-1,0,1}
+    def _eval(name, y_true_ext, X):
+        probs = meta.predict_proba(X)         # shape (N, 3): [DOWN, FLAT, UP]
+        preds_int = probs.argmax(axis=1)
+        preds_ext = np.vectorize(_META_INT_TO_EXT.get)(preds_int)
+        acc = accuracy_score(y_true_ext, preds_ext)
         try:
-            auc = roc_auc_score(y_true, probs, multi_class="ovr",
+            auc = roc_auc_score(y_true_ext, probs, multi_class="ovr",
                                 labels=[-1, 0, 1], average="macro")
         except Exception:
             auc = float("nan")
         print(f"\n{'='*16} {name} {'='*16}")
         print(f"Accuracy: {acc:.4f}   Macro-OVR AUC: {auc:.4f}")
         print(classification_report(
-            y_true, preds,
+            y_true_ext, preds_ext,
             labels=[-1, 0, 1], target_names=CLASS_NAMES,
             digits=3, zero_division=0,
         ))
-        return probs, preds
+        return probs, preds_ext
 
     print("\n" + "=" * 55)
     print("  ENSEMBLE EVALUATION")
     print("=" * 55)
-    pm, _ = _eval("Val (meta-train)", y_meta, X_meta)
-    pt, yt_pred = _eval("Test",       y_test, X_test)
+    y_test_int = np.vectorize(_META_EXT_TO_INT.get)(y_test)
+    pm, _         = _eval("Val (meta-train)", y_meta,     X_meta)
+    pt, yt_pred   = _eval("Test",             y_test,     X_test)
 
-    # ── Save meta-learner ─────────────────────────────────────────────────────
+    # Save meta-learner payload
+    # BUG-8: store the XGBClassifier-based meta model + int<->ext maps
     payload = {
         "meta_model":        meta,
+        "meta_model_type":   "XGBClassifier",
+        "meta_ext_to_int":   _META_EXT_TO_INT,
+        "meta_int_to_ext":   _META_INT_TO_EXT,
         "finbert_available": (fb is not None),
         "finbert_path":      FINBERT_SCORES_PATH,
-        # Column layout of X_meta for downstream predict.py
         "meta_feature_cols": [
             "xgb_down", "xgb_flat", "xgb_up",
             "lstm_down", "lstm_flat", "lstm_up",
             "fb_pos",   "fb_neg",   "fb_neu",
         ],
     }
+
+    # ── Save meta-learner ─────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(META_MODEL_PATH), exist_ok=True)
     with open(META_MODEL_PATH, "wb") as f:
         pickle.dump(payload, f)
-    log.info(f"Meta-learner -> {META_MODEL_PATH}")
+    log.info(f"BUG-8 FIX: XGBClassifier meta-learner saved -> {META_MODEL_PATH}")
 
     # ── Save test results ─────────────────────────────────────────────────────
     res = te_valid[["Date", "Stock"]].copy().reset_index(drop=True)

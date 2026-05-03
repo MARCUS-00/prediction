@@ -115,27 +115,49 @@ def get_stock_data(stock):
 
 
 def expand_years(df):
+    """
+    BUG-2 FIX: Do NOT back-fill or freeze values across years.
+
+    Old behaviour: ffill().bfill() on PE_Ratio/ROE/EPS propagated the most
+    recent year's value into ALL prior years (2020-2022), making all three years
+    look identical. The model learned fundamentals never change, then was shocked
+    by real variation in 2023-2025.
+
+    New behaviour:
+      - Only forward-fill (ffill) within a stock's own history — never backward.
+      - Revenue_Growth and Profit_Growth for the FIRST year (no prior year to
+        compare) remain NaN — they will be imputed in merge_features.py using
+        sector-year median, which is far more accurate than frozen values.
+      - PE_Ratio / ROE / EPS are NOT back-filled to years before data exists;
+        NaN is preserved so merge_features.py imputation handles them properly.
+    """
     final = []
     for stock in df["Stock"].unique():
-        sub = df[df["Stock"] == stock].sort_values("Year").copy()
+        sub  = df[df["Stock"] == stock].sort_values("Year").copy()
         full = pd.DataFrame({"Year": range(START_YEAR, END_YEAR + 1)})
         sub  = full.merge(sub, on="Year", how="left")
         sub["Stock"]  = stock
         sub["Sector"] = sub["Sector"].fillna(SECTOR_MAP.get(stock, "Unknown"))
         sub.sort_values("Year", inplace=True)
 
-        growth_cols    = ["Revenue_Growth", "Profit_Growth"]
-        non_growth_num = ["PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
-                          "Revenue", "Profit"]
-
-        sub[non_growth_num] = sub[non_growth_num].ffill().bfill()
-        sub[growth_cols]    = sub[growth_cols].ffill()
+        # Forward-fill only: carry known values forward (e.g., 2023 data into
+        # 2024 if 2024 filing not yet available). Do NOT backward-fill.
+        fwd_fill_cols = ["PE_Ratio", "EPS", "ROE", "Debt_to_Equity",
+                         "Revenue", "Profit"]
+        # Revenue_Growth / Profit_Growth are NOT forward-filled (each year
+        # has its own real growth rate; filling would repeat stale rates).
+        sub[fwd_fill_cols] = sub[fwd_fill_cols].ffill()
+        # Leave Revenue_Growth, Profit_Growth as NaN where not available —
+        # merge_features.py will fill with sector-year median.
 
         final.append(sub)
 
     result = pd.concat(final).sort_values(["Stock", "Year"]).reset_index(drop=True)
     real_pct = result["Revenue_Growth"].notna().mean() * 100
-    print(f"  [INFO] Revenue_Growth coverage: {real_pct:.1f}% rows have real values")
+    nan_pct  = result["Revenue_Growth"].isna().mean() * 100
+    print(f"  [INFO] BUG-2 FIX: Revenue_Growth — "
+          f"{real_pct:.1f}% real values, {nan_pct:.1f}% NaN "
+          f"(will be imputed by sector-year median in merge_features.py)")
     return result
 
 

@@ -172,12 +172,14 @@ def train():
     log.info(f"Sequences  train={X_tr.shape}  val={X_va.shape}  test={X_te.shape}")
 
     counts  = np.bincount(y_tr, minlength=NUM_CLASS).astype(float)
-    weights = torch.tensor(
-        len(y_tr) / (NUM_CLASS * np.maximum(counts, 1)),
-        dtype=torch.float32,
-    )
-    log.info(f"Class weights  DOWN={weights[0]:.3f}  FLAT={weights[1]:.3f}  "
-             f"UP={weights[2]:.3f}")
+    # BUG-5 FIX: 3x multiplier on DOWN (0) and UP (2) minority classes
+    base_w  = len(y_tr) / (NUM_CLASS * np.maximum(counts, 1))
+    MINORITY_BOOST = 3.0
+    base_w[0] *= MINORITY_BOOST   # DOWN
+    base_w[2] *= MINORITY_BOOST   # UP
+    weights = torch.tensor(base_w, dtype=torch.float32)
+    log.info(f"BUG-5 FIX: Class weights  DOWN={weights[0]:.3f}  FLAT={weights[1]:.3f}  "
+             f"UP={weights[2]:.3f} (3x boost on DOWN/UP)")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -193,11 +195,10 @@ def train():
     log.info(f"Params: {n_params:,}  device={device}  "
              f"hidden={LSTM_HIDDEN}  layers={LSTM_LAYERS}")
 
-    # --- FIX: Removed weight_decay and label_smoothing ---
-    opt   = Adam(net.parameters(), lr=LSTM_LR)
+    opt   = Adam(net.parameters(), lr=LSTM_LR, weight_decay=1e-4)
     sched = ReduceLROnPlateau(opt, mode="min",
                               patience=max(5, LSTM_PATIENCE // 3), factor=0.5)
-    crit  = nn.CrossEntropyLoss(weight=weights.to(device))
+    crit  = nn.CrossEntropyLoss(weight=weights.to(device), label_smoothing=0.05)
 
     best_loss, best_state, patience_cnt = float("inf"), None, 0
 

@@ -131,13 +131,22 @@ def predict_ensemble(df, xgb_payload=None, lstm_payload=None, meta_payload=None)
         proba = xp
 
     # ── Decode ────────────────────────────────────────────────────────────
+    # BUG-8 FIX: XGBClassifier meta-learner was trained on internal {0,1,2}
+    # labels, so predict_proba columns are [P(DOWN=0), P(FLAT=1), P(UP=2)].
+    # We map argmax → direction string using _INT_TO_LABEL directly.
     argmax_idx = proba.argmax(axis=1)   # 0/1/2
 
-    if meta_payload is not None:
+    # Check meta-learner type for backward compatibility with old LR model
+    meta_type = (meta_payload or {}).get("meta_model_type", "LogisticRegression")
+
+    if meta_payload is not None and meta_type == "XGBClassifier":
+        # New: columns are already [DOWN, FLAT, UP] in internal order
+        predicted  = list(argmax_idx)                            # internal {0,1,2}
+        dir_labels = [_INT_TO_LABEL[int(i)] for i in argmax_idx]
+    elif meta_payload is not None:
+        # Legacy: LogisticRegression meta-learner with classes_ = [-1, 0, 1]
         classes    = meta_payload["meta_model"].classes_   # [-1, 0, 1]
         ext_labels = np.array([int(classes[i]) for i in argmax_idx])
-        # FIX: ext_labels is already the external label {-1,0,1};
-        #      map to internal index only for storing in "Predicted"
         predicted  = [_EXT_TO_INT[int(l)] for l in ext_labels]
         dir_labels = [_INT_TO_LABEL[_EXT_TO_INT[int(l)]] for l in ext_labels]
     else:
